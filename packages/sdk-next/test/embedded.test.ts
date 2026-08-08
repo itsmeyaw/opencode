@@ -29,17 +29,21 @@ test.serial("embedded client uses the real router and handlers", async () => {
     const program = Effect.gen(function* () {
       const opencode = yield* OpenCode.create()
       const events: Array<{ payload?: { type?: string; properties?: { messageID?: string; sessionID?: string } } }> = []
+      const connected = Promise.withResolvers<void>()
+      const modelSwitched = Promise.withResolvers<void>()
       yield* Effect.acquireRelease(
-        Effect.promise(() => opencode.transport.events.subscribe((event) => events.push(event as (typeof events)[number]))),
+        Effect.promise(() =>
+          opencode.transport.events.subscribe((event) => {
+            events.push(event as (typeof events)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") connected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.next.model.switched") {
+              modelSwitched.resolve()
+            }
+          }),
+        ),
         (unsubscribe) => Effect.sync(unsubscribe),
       )
-      yield* Effect.promise(async () => {
-        const start = Date.now()
-        while (!events.some((event) => event.payload?.type === "server.connected")) {
-          if (Date.now() - start > 2_000) throw new Error("embedded event transport did not connect")
-          await Bun.sleep(10)
-        }
-      })
+      yield* Effect.promise(() => connected.promise)
       yield* opencode.tools.register({
         embedded_tool: Tool.make({
           description: "Embedded test tool",
@@ -55,6 +59,7 @@ test.serial("embedded client uses the real router and handlers", async () => {
         location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
       })
       yield* opencode.sessions.switchModel({ sessionID, model })
+      yield* Effect.promise(() => modelSwitched.promise)
       const selected = yield* opencode.sessions.get({ sessionID })
       const page = yield* opencode.sessions.list({ directory: AbsolutePath.make(directory) })
       const active = yield* opencode.sessions.active()
@@ -116,16 +121,24 @@ test.serial("Location-owned runner events reach the ready global client", async 
     const program = Effect.gen(function* () {
       const opencode = yield* OpenCode.create()
       const events: Array<{ payload?: { type?: string; properties?: { sessionID?: string } } }> = []
+      const connected = Promise.withResolvers<void>()
+      const created = Promise.withResolvers<void>()
       yield* Effect.acquireRelease(
-        Effect.promise(() => opencode.transport.events.subscribe((event) => events.push(event as (typeof events)[number]))),
+        Effect.promise(() =>
+          opencode.transport.events.subscribe((event) => {
+            events.push(event as (typeof events)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") connected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.created") created.resolve()
+          }),
+        ),
         (unsubscribe) => Effect.sync(unsubscribe),
       )
-      yield* waitForEvent(events, "server.connected")
+      yield* Effect.promise(() => connected.promise)
       yield* opencode.sessions.create({
         id: sessionID,
         location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
       })
-      yield* waitForEvent(events, "session.created")
+      yield* Effect.promise(() => created.promise)
       const admitted = yield* opencode.sessions.prompt({
         sessionID,
         prompt: Prompt.make({ text: "Observe this input" }),
@@ -153,39 +166,51 @@ test.serial("independent embedded hosts do not share live notifications", async 
       const second = yield* OpenCode.create()
       const firstEvents: Array<{ payload?: { type?: string; properties?: { sessionID?: string } } }> = []
       const secondEvents: Array<{ payload?: { type?: string; properties?: { sessionID?: string } } }> = []
+      const firstConnected = Promise.withResolvers<void>()
+      const secondConnected = Promise.withResolvers<void>()
+      const firstSwitched = Promise.withResolvers<void>()
+      const secondSwitched = Promise.withResolvers<void>()
       yield* Effect.acquireRelease(
-        Effect.promise(() => first.transport.events.subscribe((event) => firstEvents.push(event as (typeof firstEvents)[number]))),
+        Effect.promise(() =>
+          first.transport.events.subscribe((event) => {
+            firstEvents.push(event as (typeof firstEvents)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") firstConnected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.next.agent.switched") {
+              firstSwitched.resolve()
+            }
+          }),
+        ),
         (unsubscribe) => Effect.sync(unsubscribe),
       )
       yield* Effect.acquireRelease(
-        Effect.promise(() => second.transport.events.subscribe((event) => secondEvents.push(event as (typeof secondEvents)[number]))),
+        Effect.promise(() =>
+          second.transport.events.subscribe((event) => {
+            secondEvents.push(event as (typeof secondEvents)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") secondConnected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.next.agent.switched") {
+              secondSwitched.resolve()
+            }
+          }),
+        ),
         (unsubscribe) => Effect.sync(unsubscribe),
       )
-      yield* waitForEvent(firstEvents, "server.connected")
-      yield* waitForEvent(secondEvents, "server.connected")
+      yield* Effect.all([Effect.promise(() => firstConnected.promise), Effect.promise(() => secondConnected.promise)], {
+        discard: true,
+      })
       yield* first.sessions.create({
         id: sessionID,
         location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
       })
       yield* first.sessions.switchAgent({ sessionID, agent: Agent.ID.make("plan") })
 
-      yield* waitForEvent(firstEvents, "session.next.agent.switched")
-      yield* Effect.promise(() => Bun.sleep(100))
-      expect(secondEvents.some((event) => event.payload?.type === "session.next.agent.switched")).toBe(false)
+      yield* Effect.promise(() => firstSwitched.promise)
+      expect(Option.isNone(yield* Effect.promise(() => secondSwitched.promise).pipe(Effect.timeoutOption("100 millis")))).toBe(
+        true,
+      )
     })
     await Effect.runPromise(Effect.scoped(program))
   } finally {}
 }, 10_000)
-
-function waitForEvent(events: Array<{ payload?: { type?: string } }>, type: string) {
-  return Effect.promise(async () => {
-    const start = Date.now()
-    while (!events.some((event) => event.payload?.type === type)) {
-      if (Date.now() - start > 2_000) throw new Error(`embedded event transport did not receive ${type}`)
-      await Bun.sleep(10)
-    }
-  })
-}
 
 test.serial("embedded client is available as a Layer service", async () => {
   const directory = join(root, "layer")
