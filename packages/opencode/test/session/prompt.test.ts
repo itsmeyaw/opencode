@@ -1,6 +1,7 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
@@ -216,9 +217,9 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
-    return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
+    return AppNodeBuilder.build(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
-  return LayerNode.compile(promptRoot, replacements)
+  return AppNodeBuilder.build(promptRoot, replacements)
 }
 
 function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
@@ -230,9 +231,9 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
-    return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
+    return AppNodeBuilder.build(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
-  return LayerNode.compile(root, replacements)
+  return AppNodeBuilder.build(root, replacements)
 }
 
 function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {

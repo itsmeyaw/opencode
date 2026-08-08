@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Effect, Layer } from "effect"
@@ -11,7 +12,7 @@ import { Tool } from "@/tool/tool"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([httpClient, Truncate.node, Agent.node]), [
+  AppNodeBuilder.build(LayerNode.group([httpClient, Truncate.node, Agent.node]), [
     [httpClient, FetchHttpClient.layer as Layer.Layer<HttpClient.HttpClient>],
   ]),
 )

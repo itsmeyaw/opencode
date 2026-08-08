@@ -3,6 +3,7 @@ import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
 import { Effect, Layer, Result, Schema } from "effect"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -56,9 +57,9 @@ const replacements = [
   [RuntimeFlags.node, RuntimeFlags.layer()],
 ] as const
 
-const it = testEffect(LayerNode.compile(root, replacements))
+const it = testEffect(AppNodeBuilder.build(root, replacements))
 const withCodeMode = testEffect(
-  LayerNode.compile(root, [
+  AppNodeBuilder.build(root, [
     [Config.node, configLayer],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalCodeMode: true })],
     [
@@ -81,7 +82,7 @@ const withCodeMode = testEffect(
   ]),
 )
 const withEmptyCodeMode = testEffect(
-  LayerNode.compile(root, [
+  AppNodeBuilder.build(root, [
     [Config.node, configLayer],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalCodeMode: true })],
     [
@@ -93,7 +94,7 @@ const withEmptyCodeMode = testEffect(
     ],
   ]),
 )
-const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+const withBrokenPlugin = testEffect(AppNodeBuilder.build(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
 
 afterEach(async () => {
   await disposeAllInstances()

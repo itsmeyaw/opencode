@@ -5,11 +5,7 @@ import { Location } from "./location"
 import type { LocationError, LocationServices } from "./location-services"
 
 export interface Interface extends LayerMap.LayerMap<Location.Ref, LocationServices, LocationError> {
-  readonly invalidateDirectory?: (directory: Location.Ref["directory"]) => Effect.Effect<void>
-}
-
-export function invalidateDirectory(self: Interface, directory: Location.Ref["directory"]) {
-  return self.invalidateDirectory?.(directory) ?? Effect.void
+  readonly invalidateDirectory: (directory: Location.Ref["directory"]) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/example/LocationServiceMap") {

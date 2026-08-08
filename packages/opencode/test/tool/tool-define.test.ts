@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Schema } from "effect"
 import { Agent } from "../../src/agent/agent"
@@ -7,7 +8,7 @@ import { Tool } from "@/tool/tool"
 import { Truncate } from "@/tool/truncate"
 import { testEffect } from "../lib/effect"
 
-const it = testEffect(LayerNode.compile(LayerNode.group([Truncate.node, Agent.node])))
+const it = testEffect(AppNodeBuilder.build(LayerNode.group([Truncate.node, Agent.node])))
 
 const params = Schema.Struct({ input: Schema.String })
 

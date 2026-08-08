@@ -185,7 +185,7 @@ const locationLifecycle = Layer.effectDiscard(
   Effect.gen(function* () {
     const locations = yield* LocationServiceMap.Service
     const unregister = registerDisposer((directory) =>
-      Effect.runPromise(LocationServiceMap.invalidateDirectory(locations, AbsolutePath.make(directory))),
+      Effect.runPromise(locations.invalidateDirectory(AbsolutePath.make(directory))),
     )
     yield* Effect.addFinalizer(() => Effect.sync(unregister))
   }),

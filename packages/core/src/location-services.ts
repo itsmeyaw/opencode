@@ -1,4 +1,4 @@
-import { Effect, Layer, LayerMap } from "effect"
+import { Effect, Layer, LayerMap, RcMap } from "effect"
 import { AgentV2 } from "./agent"
 import { AISDK } from "./aisdk"
 import { Catalog } from "./catalog"
@@ -10,6 +10,7 @@ import { FileMutation } from "./file-mutation"
 import { FileSystem } from "./filesystem"
 import { FileSystemSearch } from "./filesystem/search"
 import { Watcher } from "./filesystem/watcher"
+import { FSUtil } from "./fs-util"
 import { Image } from "./image"
 import { Integration } from "./integration"
 import { Location } from "./location"
@@ -29,6 +30,7 @@ import { SessionRunnerModel } from "./session/runner/model"
 import { SessionTodo } from "./session/todo"
 import { SkillV2 } from "./skill"
 import { SkillGuidance } from "./skill/guidance"
+import { AbsolutePath } from "./schema"
 import { Snapshot } from "./snapshot"
 import { SystemContextBuiltIns } from "./system-context/builtins"
 import { SystemContextRegistry } from "./system-context/registry"
@@ -109,40 +111,24 @@ export function buildLocationServiceMap(
         },
         { idleTimeToLive: "60 minutes" },
       )
-      const refs = new Map<Location.Ref["directory"], Map<Location.Ref["workspaceID"], Location.Ref>>()
+      const normalizeDirectory = (directory: Location.Ref["directory"]) => AbsolutePath.make(FSUtil.resolve(directory))
       const normalize = (ref: Location.Ref) =>
-        Location.Ref.make({ directory: ref.directory, workspaceID: ref.workspaceID })
-      const remember = (ref: Location.Ref) => {
-        const normalized = normalize(ref)
-        const directory = refs.get(normalized.directory) ?? new Map()
-        refs.set(normalized.directory, directory)
-        directory.set(normalized.workspaceID, normalized)
-        return normalized
-      }
-      const forget = (ref: Location.Ref) => {
-        const directory = refs.get(ref.directory)
-        if (!directory) return
-        directory.delete(ref.workspaceID)
-        if (directory.size === 0) refs.delete(ref.directory)
-      }
+        Location.Ref.make({ directory: normalizeDirectory(ref.directory), workspaceID: ref.workspaceID })
       return {
         ...locations,
-        get: (ref: Location.Ref) => locations.get(remember(ref)),
-        contextEffect: (ref: Location.Ref) => locations.contextEffect(remember(ref)),
-        invalidate: (ref: Location.Ref) => {
-          const normalized = normalize(ref)
-          forget(normalized)
-          return locations.invalidate(normalized)
-        },
-        invalidateDirectory: (directory: Location.Ref["directory"]) => {
-          const found = refs.get(directory)
-          refs.delete(directory)
-          if (!found) return Effect.void
-          return Effect.forEach(found.values(), (ref) => locations.invalidate(ref), {
-            concurrency: "unbounded",
-            discard: true,
-          })
-        },
+        get: (ref: Location.Ref) => locations.get(normalize(ref)),
+        contextEffect: (ref: Location.Ref) => locations.contextEffect(normalize(ref)),
+        invalidate: (ref: Location.Ref) => locations.invalidate(normalize(ref)),
+        invalidateDirectory: (directory: Location.Ref["directory"]) =>
+          Effect.gen(function* () {
+            const normalized = normalizeDirectory(directory)
+            const refs = yield* RcMap.keys(locations.rcMap)
+            yield* Effect.forEach(
+              Array.from(refs).filter((ref) => ref.directory === normalized),
+              (ref) => locations.invalidate(ref),
+              { concurrency: "unbounded", discard: true },
+            )
+          }),
       }
     }),
   )
