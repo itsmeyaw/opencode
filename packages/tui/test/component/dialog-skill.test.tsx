@@ -4,6 +4,9 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { expect, test } from "bun:test"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+import { Effect, Exit, Scope } from "effect"
 import { createSignal, onCleanup, onMount } from "solid-js"
 import { DialogSkill } from "../../src/component/dialog-skill"
 import { TuiConfigProvider } from "../../src/config"
@@ -69,7 +72,12 @@ async function mountDialog(input: {
 
     return (
       <TestTuiContexts paths={{ home: input.root, state, worktree: input.root }}>
-        <SDKProvider url="http://test" directory={directory} events={input.events ?? eventSource()} fetch={input.fetch}>
+        <SDKProvider
+          url="http://test"
+          directory={input.location?.directory ?? directory}
+          events={input.events ?? eventSource()}
+          fetch={input.fetch}
+        >
           <OpencodeKeymapProvider keymap={keymap}>
             <TuiConfigProvider config={config}>
               <KVProvider>
@@ -721,5 +729,63 @@ test("Enter directly selects a denied skill and closes the dialog", async () => 
     expect(dialog.app.captureCharFrame()).not.toContain("Skills")
   } finally {
     await dialog.cleanup()
+  }
+})
+
+test.serial("uses an embedded host for authoritative reads, mutations, and external permission refreshes", async () => {
+  await using tmp = await tmpdir()
+  const database = Flag.OPENCODE_DB
+  const config = process.env.OPENCODE_CONFIG_DIR
+  Flag.OPENCODE_DB = path.join(tmp.path, "opencode.sqlite")
+  process.env.OPENCODE_CONFIG_DIR = path.join(tmp.path, "config")
+  const { AbsolutePath, Agent, OpenCode } = await import("@opencode-ai/sdk-next")
+  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
+  const scope = Effect.runSync(Scope.make())
+  const opencode = await Effect.runPromise(OpenCode.create().pipe(Effect.provideService(Scope.Scope, scope)))
+  Bun.spawnSync(["git", "init", tmp.path])
+  await Bun.write(path.join(tmp.path, "opencode.json"), JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }))
+  await mkdir(path.join(tmp.path, ".opencode", "skills", "embedded"), { recursive: true })
+  await Bun.write(
+    path.join(tmp.path, ".opencode", "skills", "embedded", "SKILL.md"),
+    "---\nname: embedded-transport\ndescription: Embedded transport skill\n---\n# Embedded",
+  )
+  const location = { directory: tmp.path }
+  const session = await Effect.runPromise(
+    opencode.sessions.create({ location: { directory: AbsolutePath.make(tmp.path) }, agent: Agent.ID.make("build") }),
+  )
+  const external = createOpencodeClient({
+    baseUrl: "http://opencode.local",
+    directory: tmp.path,
+    fetch: opencode.transport.fetch,
+  })
+  const dialog = await mountDialog({
+    root: tmp.path,
+    fetch: opencode.transport.fetch,
+    events: {
+      subscribe: (handler) => opencode.transport.events.subscribe((event) => handler(event as GlobalEvent)),
+    },
+    location,
+    sessionID: session.id,
+  })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Denied"), "embedded authoritative read")
+    await wait(() => dialog.app.captureCharFrame().includes("customize-opencode"), "embedded builtin skill")
+    await external.v2.skill.permission.set(
+      { agent: "build", name: "customize-opencode", effect: "allow" },
+      { throwOnError: true },
+    )
+    await wait(() => dialog.app.captureCharFrame().includes("Allowed"), "embedded mutation refresh")
+    await external.v2.skill.permission.set(
+      { agent: "build", name: "customize-opencode", effect: "ask" },
+      { throwOnError: true },
+    )
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"), "embedded external refresh")
+  } finally {
+    await dialog.cleanup()
+    await Effect.runPromise(Scope.close(scope, Exit.void))
+    Flag.OPENCODE_DB = database
+    if (config === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = config
   }
 })
