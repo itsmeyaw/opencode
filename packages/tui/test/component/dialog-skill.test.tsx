@@ -295,6 +295,27 @@ test("refreshes an open dialog from matching external skill permission events", 
     await Bun.sleep(20)
     expect(reads).toBe(1)
 
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: "wrk_other",
+      payload: {
+        id: "evt_other_workspace",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_other_agent",
+        type: "skill.permission.updated",
+        properties: { agent: "plan", name: "review", effect: "deny" },
+      },
+    })
+    await Bun.sleep(20)
+    expect(reads).toBe(1)
+
     effect = "deny"
     events.emit({
       directory: requestLocation.directory,
@@ -306,6 +327,63 @@ test("refreshes an open dialog from matching external skill permission events", 
       },
     })
     await wait(() => reads === 2 && dialog.app.captureCharFrame().includes("Denied"), "external refresh")
+    expect(dialog.app.captureCharFrame()).toContain("Skills")
+  } finally {
+    await dialog.cleanup()
+  }
+})
+
+test("defers an external refresh until a local mutation cannot be overwritten by its older read", async () => {
+  await using tmp = await tmpdir()
+  const events = createEventSource()
+  const requestLocation = { directory: "/tmp/moved", workspaceID: "wrk_test" }
+  let reads = 0
+  let finishOlderRead!: (response: Response) => void
+  const olderRead = new Promise<Response>((resolve) => {
+    finishOlderRead = resolve
+  })
+  const response = (effect: string) =>
+    json({
+      location,
+      data: [
+        {
+          name: "review",
+          description: "Review changes",
+          location: "/skills/review/SKILL.md",
+          content: "# Review",
+          effect,
+        },
+      ],
+    })
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
+    if (request.method === "PUT") return json({ location, data: { name: "review", effect: "allow" } })
+    reads++
+    if (reads === 1) return response("ask")
+    if (reads === 2) return olderRead
+    return response("deny")
+  }) as typeof globalThis.fetch
+  const dialog = await mountDialog({ root: tmp.path, fetch, location: requestLocation, events: events.source, sessionID: "ses_one" })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"))
+    dialog.app.mockInput.pressKey(" ")
+    await wait(() => reads === 2 && dialog.app.captureCharFrame().includes("Loading"), "local refresh")
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_external",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    expect(reads).toBe(2)
+    finishOlderRead(response("allow"))
+    await wait(() => reads === 3 && dialog.app.captureCharFrame().includes("Denied"), "deferred external refresh")
+    expect(dialog.app.captureCharFrame()).not.toContain("Loading")
     expect(dialog.app.captureCharFrame()).toContain("Skills")
   } finally {
     await dialog.cleanup()

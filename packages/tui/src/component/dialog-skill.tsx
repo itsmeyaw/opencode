@@ -49,6 +49,7 @@ export function DialogSkill(props: DialogSkillProps) {
 
   const [loadError, setLoadError] = createSignal<unknown>()
   const [loading, setLoading] = createSignal<(PermissionRequest & { name: string }) | undefined>()
+  let refreshAfterMutation = false
 
   const load = (request: PermissionRequest) =>
     sdk.client.v2.skill.permission.list(request, { throwOnError: true }).then((result) => result.data.data)
@@ -81,6 +82,10 @@ export function DialogSkill(props: DialogSkillProps) {
       if (metadata.directory !== props.location.directory) return
       if (metadata.workspace !== props.location.workspaceID) return
       if (update.properties.agent !== props.agent) return
+      if (loading()) {
+        refreshAfterMutation = true
+        return
+      }
       void refetch()
     }),
   )
@@ -163,6 +168,10 @@ export function DialogSkill(props: DialogSkillProps) {
           })
         } finally {
           setLoading(undefined)
+          if (refreshAfterMutation) {
+            refreshAfterMutation = false
+            void refetch()
+          }
         }
       },
     },
