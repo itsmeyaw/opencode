@@ -197,7 +197,7 @@ const discoverSkills = Effect.fnUntraced(function* (
       .up({ targets: externalDirs, start: directory, stop: worktree })
       .pipe(Effect.catch(() => Effect.succeed([] as string[])))
 
-    for (const root of upDirs) {
+    for (const root of upDirs.toSorted((a, b) => externalDirs.indexOf(path.basename(a)) - externalDirs.indexOf(path.basename(b)))) {
       yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project" })
     }
   }
@@ -237,10 +237,8 @@ const loadSkills = Effect.fnUntraced(function* (
   discovered: DiscoveryState,
   events: EventV2Bridge.Service["Service"],
 ) {
-  yield* Effect.forEach(discovered.matches, (match) => add(state, match, events), {
-    concurrency: "unbounded",
-    discard: true,
-  })
+  // Source order is the duplicate precedence contract, so loading cannot race.
+  yield* Effect.forEach(discovered.matches, (match) => add(state, match, events), { discard: true })
 
   yield* Effect.logInfo("init", { count: Object.keys(state.skills).length })
 })

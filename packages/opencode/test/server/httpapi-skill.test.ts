@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { Server } from "../../src/server/server"
-import { Effect, Fiber } from "effect"
+import { Context, Effect, Fiber, Layer } from "effect"
+import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import Http from "node:http"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
@@ -42,10 +45,6 @@ description: ${description}
   )
 }
 
-function sortedNames(skills: ReadonlyArray<{ name: string }>) {
-  return skills.map((skill) => skill.name).toSorted()
-}
-
 function toolNames(input: Record<string, unknown> | undefined) {
   if (!Array.isArray(input?.tools)) return []
   return input.tools.flatMap((tool) => {
@@ -63,35 +62,43 @@ function enableExternalSources() {
 }
 
 describe("skill HttpApi", () => {
-  test("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", async () => {
-    await using home = await tmpdir()
-    await using project = await tmpdir({ git: true })
-    using catalog = Bun.serve({
-      port: 0,
-      fetch(request) {
-        const pathname = new URL(request.url).pathname
-        if (pathname === "/catalog/index.json") {
-          return Response.json({
-            skills: [
-              { name: "ticket-2-url", version: "1", files: ["SKILL.md"] },
-              { name: "customize-opencode", version: "1", files: ["SKILL.md"] },
-            ],
-          })
-        }
-        if (pathname === "/catalog/ticket-2-url/SKILL.md") {
-          return new Response(`---\nname: ticket-2-url\ndescription: URL skill\n---\n# URL skill`)
-        }
-        if (pathname === "/catalog/customize-opencode/SKILL.md") {
-          return new Response(`---\nname: customize-opencode\ndescription: URL duplicate\n---\n# URL duplicate`)
-        }
-        return new Response("Not Found", { status: 404 })
-      },
-    })
-
-    process.env.OPENCODE_TEST_HOME = home.path
-    process.env.OPENCODE_CONFIG_DIR = path.join(home.path, "config")
-    enableExternalSources()
-    await Promise.all([
+  test("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", () =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(
+            NodeHttpServer.layer(Http.createServer, { host: "127.0.0.1", port: 0 }).pipe(Layer.provide(NodeServices.layer)),
+          )
+          const catalog = Context.get(context, HttpServer.HttpServer)
+          yield* catalog.serve(
+            HttpServerRequest.HttpServerRequest.use((request) => {
+              const pathname = new URL(request.url, "http://localhost").pathname
+              if (pathname === "/catalog/index.json")
+                return HttpServerResponse.json({
+                  skills: [
+                    { name: "ticket-2-url", version: "1", files: ["SKILL.md"] },
+                    { name: "customize-opencode", version: "1", files: ["SKILL.md"] },
+                  ],
+                })
+              if (pathname === "/catalog/ticket-2-url/SKILL.md")
+                return Effect.succeed(
+                  HttpServerResponse.text(`---\nname: ticket-2-url\ndescription: URL skill\n---\n# URL skill`),
+                )
+              if (pathname === "/catalog/customize-opencode/SKILL.md")
+                return Effect.succeed(
+                  HttpServerResponse.text(`---\nname: customize-opencode\ndescription: URL duplicate\n---\n# URL duplicate`),
+                )
+              return Effect.succeed(HttpServerResponse.text("Not Found", { status: 404 }))
+            }),
+          )
+          const address = HttpServer.formatAddress(catalog.address)
+          yield* Effect.promise(async () => {
+            await using home = await tmpdir()
+            await using project = await tmpdir({ git: true })
+            process.env.OPENCODE_TEST_HOME = home.path
+            process.env.OPENCODE_CONFIG_DIR = path.join(home.path, "config")
+            enableExternalSources()
+            await Promise.all([
       writeSkill(home.path, ".claude/skills/customize", "customize-opencode", "Global Claude duplicate"),
       writeSkill(home.path, ".agents/skills/customize", "customize-opencode", "Global agent duplicate"),
       writeSkill(process.env.OPENCODE_CONFIG_DIR, "skills/global-opencode", "ticket-2-global", "Global OpenCode skill"),
@@ -106,33 +113,40 @@ describe("skill HttpApi", () => {
           lsp: false,
           skills: {
             paths: ["./extra"],
-            urls: [`http://127.0.0.1:${catalog.port}/catalog/`],
+            urls: [`${address}/catalog/`],
           },
         }),
       ),
-    ])
+            ])
 
-    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
-    try {
+            const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+            try {
       const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
       const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const repeated = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-      expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-      expect(sortedNames(current.data.data)).toEqual([
+      expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+      expect(current.data.data.map((skill) => skill.name)).toEqual([
         "customize-opencode",
+        "ticket-2-project",
         "ticket-2-global",
         "ticket-2-path",
-        "ticket-2-project",
         "ticket-2-url",
       ])
-      expect(current.data.data.map((skill) => skill.name)).toEqual(repeated.data.data.map((skill) => skill.name))
+      expect(repeated.data.data.map((skill) => skill.name)).toEqual(current.data.data.map((skill) => skill.name))
+      expect((await sdk.app.skills(undefined, { throwOnError: true })).data.map((skill) => skill.name)).toEqual(
+        current.data.data.map((skill) => skill.name),
+      )
       expect(current.data.data.find((skill) => skill.name === "customize-opencode")?.description).toBe("URL duplicate")
-    } finally {
-      await listener.stop()
-    }
-  })
+            } finally {
+              await listener.stop()
+            }
+          })
+        }),
+      ).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  )
 
   test("matches eligible global and project Claude and agent skill sources", async () => {
     await using home = await tmpdir()
@@ -155,14 +169,14 @@ describe("skill HttpApi", () => {
       const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-      expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-      expect(sortedNames(current.data.data)).toEqual([
+      expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+      expect(current.data.data.map((skill) => skill.name)).toEqual([
         "customize-opencode",
-        "ticket-2-global-agent",
         "ticket-2-global-claude",
-        "ticket-2-opencode",
-        "ticket-2-project-agent",
+        "ticket-2-global-agent",
         "ticket-2-project-claude",
+        "ticket-2-project-agent",
+        "ticket-2-opencode",
       ])
     } finally {
       await listener.stop()
@@ -192,12 +206,12 @@ describe("skill HttpApi", () => {
         const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
         const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-        expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-        expect(sortedNames(current.data.data)).toEqual([
+        expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+        expect(current.data.data.map((skill) => skill.name)).toEqual([
           "customize-opencode",
           "ticket-2-global-agent",
-          "ticket-2-opencode",
           "ticket-2-project-agent",
+          "ticket-2-opencode",
         ])
       } finally {
         await listener.stop()
@@ -232,8 +246,8 @@ describe("skill HttpApi", () => {
       const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-      expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-      expect(sortedNames(current.data.data)).toEqual(["customize-opencode", "ticket-2-opencode", "ticket-2-path"])
+      expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+      expect(current.data.data.map((skill) => skill.name)).toEqual(["customize-opencode", "ticket-2-opencode", "ticket-2-path"])
     } finally {
       await listener.stop()
     }
