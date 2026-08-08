@@ -56,11 +56,17 @@ describe("skill HttpApi", () => {
         const pathname = new URL(request.url).pathname
         if (pathname === "/catalog/index.json") {
           return Response.json({
-            skills: [{ name: "ticket-2-url", version: "1", files: ["SKILL.md"] }],
+            skills: [
+              { name: "ticket-2-url", version: "1", files: ["SKILL.md"] },
+              { name: "customize-opencode", version: "1", files: ["SKILL.md"] },
+            ],
           })
         }
         if (pathname === "/catalog/ticket-2-url/SKILL.md") {
           return new Response(`---\nname: ticket-2-url\ndescription: URL skill\n---\n# URL skill`)
+        }
+        if (pathname === "/catalog/customize-opencode/SKILL.md") {
+          return new Response(`---\nname: customize-opencode\ndescription: URL duplicate\n---\n# URL duplicate`)
         }
         return new Response("Not Found", { status: 404 })
       },
@@ -70,8 +76,11 @@ describe("skill HttpApi", () => {
     process.env.OPENCODE_CONFIG_DIR = path.join(home.path, "config")
     enableExternalSources()
     await Promise.all([
+      writeSkill(home.path, ".claude/skills/customize", "customize-opencode", "Global Claude duplicate"),
+      writeSkill(home.path, ".agents/skills/customize", "customize-opencode", "Global agent duplicate"),
       writeSkill(process.env.OPENCODE_CONFIG_DIR, "skills/global-opencode", "ticket-2-global", "Global OpenCode skill"),
       writeSkill(project.path, ".opencode/skill/project", "ticket-2-project", "Project OpenCode skill"),
+      writeSkill(project.path, ".opencode/skill/customize", "customize-opencode", "Project OpenCode duplicate"),
       writeSkill(project.path, "extra/path", "ticket-2-path", "Configured path skill"),
       writeSkill(project.path, "extra/customize", "customize-opencode", "Configured duplicate"),
       Bun.write(
@@ -103,10 +112,7 @@ describe("skill HttpApi", () => {
         "ticket-2-url",
       ])
       expect(current.data.data.map((skill) => skill.name)).toEqual(repeated.data.data.map((skill) => skill.name))
-      expect(current.data.data.find((skill) => skill.name === "customize-opencode")).toMatchObject({
-        description: "Configured duplicate",
-        location: path.join(project.path, "extra", "customize", "SKILL.md"),
-      })
+      expect(current.data.data.find((skill) => skill.name === "customize-opencode")?.description).toBe("URL duplicate")
     } finally {
       await listener.stop()
     }
