@@ -23,13 +23,28 @@ const environment = [
 ] as const
 
 const original = Object.fromEntries(environment.map((key) => [key, process.env[key]]))
+let environmentTail = Promise.resolve()
+
+function environmentTest(name: string, fn: () => Promise<void>) {
+  return test(name, async () => {
+    const previous = environmentTail
+    const release = Promise.withResolvers<void>()
+    environmentTail = previous.then(() => release.promise)
+    await previous
+    try {
+      await fn()
+    } finally {
+      for (const key of environment) {
+        const value = original[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      release.resolve()
+    }
+  })
+}
 
 afterEach(async () => {
-  for (const key of environment) {
-    const value = original[key]
-    if (value === undefined) delete process.env[key]
-    else process.env[key] = value
-  }
   await disposeAllInstances()
   await resetDatabase()
 })
@@ -62,7 +77,7 @@ function enableExternalSources() {
 }
 
 describe("skill HttpApi", () => {
-  test("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", () =>
+  environmentTest("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", () =>
     Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -148,7 +163,7 @@ describe("skill HttpApi", () => {
     ),
   )
 
-  test("matches eligible global and project Claude and agent skill sources", async () => {
+  environmentTest("matches eligible global and project Claude and agent skill sources", async () => {
     await using home = await tmpdir()
     await using project = await tmpdir({ git: true })
     process.env.OPENCODE_TEST_HOME = home.path
@@ -183,7 +198,7 @@ describe("skill HttpApi", () => {
     }
   })
 
-  test("preserves direct and broad Claude skill disable flags", async () => {
+  environmentTest("preserves direct and broad Claude skill disable flags", async () => {
     for (const flag of ["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS", "OPENCODE_DISABLE_CLAUDE_CODE"] as const) {
       await using home = await tmpdir()
       await using project = await tmpdir({ git: true })
@@ -220,7 +235,7 @@ describe("skill HttpApi", () => {
     }
   })
 
-  test("external disable excludes only automatic Claude and agent sources", async () => {
+  environmentTest("external disable excludes only automatic Claude and agent sources", async () => {
     await using home = await tmpdir()
     await using project = await tmpdir({ git: true })
     process.env.OPENCODE_TEST_HOME = home.path
