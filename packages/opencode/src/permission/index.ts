@@ -2,21 +2,35 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Deferred, Effect, Layer, Context } from "effect"
+import { Deferred, Effect, Layer, Context, ScopedCache } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { AgentV2 } from "@opencode-ai/core/agent"
+import { LocationServiceMap } from "@opencode-ai/core/location-services"
+import { SkillPermission } from "@opencode-ai/core/permission/skill"
+import { SessionV2 } from "@opencode-ai/core/session"
+import { Skill } from "@opencode-ai/schema/skill"
+import { EventV2 } from "@opencode-ai/core/event"
 
 export const Event = PermissionV1.Event
 
+type AskInput = PermissionV1.AskInput & { readonly agent?: string }
+
 export interface Interface {
-  readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
+  readonly ask: (input: AskInput) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
+  readonly resolveSkills: (input: {
+    readonly agent: string
+    readonly sessionID: string
+    readonly names: ReadonlyArray<string>
+  }) => Effect.Effect<PermissionV1.Ruleset>
 }
 
 interface PendingEntry {
   info: PermissionV1.Request
+  agent?: string
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
 }
 
@@ -43,6 +57,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const locations = yield* LocationServiceMap.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         void ctx
@@ -64,13 +79,16 @@ const layer = Layer.effect(
       }),
     )
 
-    const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
+    const ask = Effect.fn("Permission.ask")(function* (input: AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
-      const { ruleset, ...request } = input
+      const { ruleset, agent, ...request } = input
       let needsAsk = false
 
       for (const pattern of request.patterns) {
-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+        const rule =
+          request.permission === "skill"
+            ? evaluate(request.permission, pattern, ruleset)
+            : evaluate(request.permission, pattern, ruleset, approved)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
           return yield* new PermissionV1.DeniedError({
@@ -96,7 +114,7 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, deferred })
+      pending.set(id, { info, agent, deferred })
       yield* events.publish(Event.Asked, info)
       return yield* Effect.ensuring(
         Deferred.await(deferred),
@@ -171,7 +189,61 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.info)
     })
 
-    return Service.of({ ask, reply, list })
+    const resolveSkills = Effect.fn("Permission.resolveSkills")(function* (input: {
+      readonly agent: string
+      readonly sessionID: string
+      readonly names: ReadonlyArray<string>
+    }) {
+      const location = yield* InstanceState.location
+      const approved = (yield* InstanceState.get(state)).approved
+      const result = yield* Effect.gen(function* () {
+        const permissions = yield* SkillPermission.Service
+        return yield* permissions.resolve({
+          agent: AgentV2.ID.make(input.agent),
+          sessionID: SessionV2.ID.make(input.sessionID),
+          names: input.names,
+          approvals: approved
+            .filter((rule) => rule.permission === "skill")
+            .map((rule) => ({ action: rule.permission, resource: rule.pattern, effect: "allow" })),
+        })
+      }).pipe(Effect.provide(locations.get(location)), Effect.orDie)
+      return result.states.map(
+        (item): PermissionV1.Rule => ({ permission: "skill", pattern: item.name, action: item.effect }),
+      )
+    })
+
+    const unsubscribe = yield* events.listen((event) =>
+      Effect.gen(function* () {
+        if (event.type !== Skill.Event.PermissionUpdated.type) return
+        const data = event.data as EventV2.Data<typeof Skill.Event.PermissionUpdated>
+        if (data.effect === "ask" || !event.location) return
+        if (!(yield* ScopedCache.has(state.cache, event.location.directory))) return
+        const pending = (yield* ScopedCache.get(state.cache, event.location.directory)).pending
+        for (const [id, item] of pending) {
+          if (item.info.permission !== "skill" || item.agent !== data.agent) continue
+          if (!item.info.patterns.every((pattern) => pattern === data.name)) continue
+          pending.delete(id)
+          const reply = data.effect === "allow" ? "always" : "reject"
+          yield* events.publish(
+            Event.Replied,
+            {
+              sessionID: item.info.sessionID,
+              requestID: item.info.id,
+              reply,
+            },
+            { location: event.location },
+          )
+          if (data.effect === "allow") {
+            yield* Deferred.succeed(item.deferred, undefined)
+            continue
+          }
+          yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+        }
+      }),
+    )
+    yield* Effect.addFinalizer(() => unsubscribe)
+
+    return Service.of({ ask, reply, list, resolveSkills })
   }),
 )
 
@@ -218,6 +290,10 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [EventV2Bridge.node, LocationServiceMap.node],
+})
 
 export * as Permission from "."

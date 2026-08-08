@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Skill } from "@/skill"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -140,6 +141,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const skill = yield* Skill.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -343,6 +345,7 @@ const layer = Layer.effect(
               .ask({
                 ...req,
                 sessionID,
+                agent: taskAgent.name,
                 ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
               })
               .pipe(Effect.orDie),
@@ -1222,10 +1225,19 @@ const layer = Layer.effect(
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
+            const skillRules = yield* permission.resolveSkills({
+              agent: agent.name,
+              sessionID,
+              names: (yield* skill.all()).map((item) => item.name),
+            })
+            const effectiveSession = {
+              ...session,
+              permission: Permission.merge(session.permission ?? [], skillRules),
+            }
 
             const tools = yield* SessionTools.resolve({
               agent,
-              session,
+              session: effectiveSession,
               model,
               processor: handle,
               bypassAgentCheck,
@@ -1239,6 +1251,7 @@ const layer = Layer.effect(
               Effect.provideService(Truncate.Service, truncate),
               Effect.provideService(RuntimeFlags.Service, flags),
             )
+            if (skillRules.length > 0 && skillRules.every((rule) => rule.action === "deny")) delete tools.skill
 
             if (lastUser.format?.type === "json_schema") {
               tools["StructuredOutput"] = createStructuredOutputTool({
@@ -1255,7 +1268,7 @@ const layer = Layer.effect(
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
+              sys.skills(agent, effectiveSession.permission),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
@@ -1272,7 +1285,7 @@ const layer = Layer.effect(
             const result = yield* handle.process({
               user: lastUser,
               agent,
-              permission: session.permission,
+              permission: effectiveSession.permission,
               sessionID,
               parentSessionID: session.parentID,
               system,
@@ -1625,6 +1638,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    Skill.node,
   ],
 })
 

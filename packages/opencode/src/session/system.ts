@@ -41,7 +41,7 @@ export function provider(model: Provider.Model) {
 
 export interface Interface {
   readonly environment: (model: Provider.Model) => Effect.Effect<string[]>
-  readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
+  readonly skills: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
   readonly mcp: (agent: Agent.Info, permission?: PermissionV1.Ruleset) => Effect.Effect<string | undefined>
 }
 
@@ -93,10 +93,12 @@ const layer = Layer.effect(
         ].filter((part): part is string => part !== undefined)
       }),
 
-      skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
-        if (Permission.disabled(["skill"], agent.permission).has("skill")) return
-
-        const list = yield* skill.available(agent)
+      skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
+        const list = yield* skill.available({
+          ...agent,
+          permission: Permission.merge(agent.permission, permission ?? []),
+        })
+        if (list.length === 0) return
 
         return [
           "Skills provide specialized instructions and workflows for specific tasks.",

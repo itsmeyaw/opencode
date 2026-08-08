@@ -33,6 +33,7 @@ export interface Interface {
     readonly agent?: AgentV2.ID
     readonly sessionID?: SessionV2.ID
     readonly names: ReadonlyArray<string>
+    readonly approvals?: Permission.Ruleset
   }) => Effect.Effect<Resolution, SessionV2.NotFoundError>
 }
 
@@ -52,6 +53,7 @@ const layer = Layer.effect(
       readonly agent?: AgentV2.ID
       readonly sessionID?: SessionV2.ID
       readonly names: ReadonlyArray<string>
+      readonly approvals?: Permission.Ruleset
     }) {
       const session = input.sessionID ? yield* sessions.get(input.sessionID) : undefined
       if (
@@ -66,9 +68,12 @@ const layer = Layer.effect(
         ...(agent.info?.permissions ?? missingAgentPermissions),
         ...(input.sessionID ? yield* sessions.permissions(input.sessionID) : []),
       ]
-      const remembered = (yield* saved.list({ projectID: location.project.id })).map(
-        (item): Permission.Rule => ({ action: item.action, resource: item.resource, effect: "allow" }),
-      )
+      const remembered = [
+        ...(yield* saved.list({ projectID: location.project.id })).map(
+          (item): Permission.Rule => ({ action: item.action, resource: item.resource, effect: "allow" }),
+        ),
+        ...(input.approvals ?? []),
+      ]
       const states = input.names.map(
         (name): Skill.PermissionState => ({
           name,
