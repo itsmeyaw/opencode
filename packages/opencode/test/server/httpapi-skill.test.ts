@@ -46,6 +46,16 @@ function sortedNames(skills: ReadonlyArray<{ name: string }>) {
   return skills.map((skill) => skill.name).toSorted()
 }
 
+function toolNames(input: Record<string, unknown> | undefined) {
+  if (!Array.isArray(input?.tools)) return []
+  return input.tools.flatMap((tool) => {
+    if (!tool || typeof tool !== "object" || !("function" in tool)) return []
+    const fn = tool.function
+    if (!fn || typeof fn !== "object" || !("name" in fn) || typeof fn.name !== "string") return []
+    return [fn.name]
+  })
+}
+
 function enableExternalSources() {
   process.env.OPENCODE_DISABLE_CLAUDE_CODE = "false"
   process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = "false"
@@ -590,15 +600,85 @@ describe("skill HttpApi", () => {
           )
         }
         const inputs = yield* llm.inputs
+        const first = inputs[0] ?? {}
+        const firstMessages = Array.isArray(first.messages) ? first.messages : []
         const third = inputs[2] ?? {}
         const thirdMessages = Array.isArray(third.messages) ? third.messages : []
         expect(JSON.stringify(inputs[0])).toContain("ticket-4-provider")
         expect(JSON.stringify(inputs[1])).toContain("ticket-4-provider")
+        expect(toolNames(inputs[0])).toContain("skill")
+        expect(toolNames(inputs[1])).toContain("skill")
+        expect(toolNames(inputs[2])).not.toContain("skill")
         expect(JSON.stringify(thirdMessages.at(-1))).not.toContain("ticket-4-provider")
         expect(JSON.stringify(thirdMessages.at(-1))).toContain("Skill guidance is no longer available")
-        expect(JSON.stringify(thirdMessages[0])).toContain("ticket-4-provider")
+        expect(thirdMessages[0]).toEqual(firstMessages[0])
         expect(JSON.stringify(inputs[2]?.messages)).toContain("test allow")
         expect(JSON.stringify(inputs[2]?.messages)).toContain("test ask")
+        const context = yield* Effect.promise(() => sdk.v2.session.context({ sessionID }, { throwOnError: true }))
+        expect(context.data.data.filter((message) => message.type === "system").map((message) => message.text)).toEqual([
+          "Skill guidance is no longer available. Do not use any previously listed skill.",
+        ])
+
+        yield* llm.text("completed plan")
+        const plan = yield* Effect.promise(() =>
+          sdk.v2.session.create(
+            {
+              agent: "plan",
+              model: { id: "test-model", providerID: "test" },
+              location: { directory: project.path },
+            },
+            { throwOnError: true },
+          ),
+        )
+        yield* Effect.promise(() =>
+          sdk.v2.session.prompt(
+            { sessionID: plan.data.data.id, prompt: { text: "test second agent" } },
+            { throwOnError: true },
+          ),
+        )
+        yield* llm.wait(4)
+        expect(toolNames((yield* llm.inputs)[3])).not.toContain("skill")
+
+        const idle = yield* Effect.promise(() =>
+          sdk.v2.session.create(
+            {
+              agent: "build",
+              model: { id: "test-model", providerID: "test" },
+              location: { directory: project.path },
+            },
+            { throwOnError: true },
+          ),
+        )
+        const calls = yield* llm.calls
+        yield* Effect.promise(() =>
+          sdk.v2.skill.permission.set({ agent: "build", name: "ticket-4-provider", effect: "allow" }, { throwOnError: true }),
+        )
+        const idleActive = yield* Effect.promise(() => sdk.v2.session.active({ throwOnError: true }))
+        expect(idleActive.data.data).not.toHaveProperty(idle.data.data.id)
+        expect(yield* llm.calls).toBe(calls)
+
+        const release = Promise.withResolvers<void>()
+        yield* llm.hold("completed in flight", release.promise)
+        yield* Effect.promise(() =>
+          sdk.v2.session.prompt(
+            { sessionID, prompt: { text: "test in flight mutation" } },
+            { throwOnError: true },
+          ),
+        )
+        yield* llm.wait(calls + 1)
+        yield* Effect.promise(() =>
+          sdk.v2.skill.permission.set({ agent: "build", name: "ticket-4-provider", effect: "deny" }, { throwOnError: true }),
+        )
+        const active = yield* Effect.promise(() => sdk.v2.session.active({ throwOnError: true }))
+        expect(active.data.data).toHaveProperty(sessionID)
+        expect(yield* llm.calls).toBe(calls + 1)
+        release.resolve()
+        yield* pollWithTimeout(
+          Effect.promise(() => sdk.v2.session.active({ throwOnError: true })).pipe(
+            Effect.map((result) => (sessionID in result.data.data ? undefined : true)),
+          ),
+          "in-flight provider turn did not settle",
+        )
       }),
     20_000,
   )
@@ -680,6 +760,9 @@ describe("skill HttpApi", () => {
         expect(JSON.stringify(inputs[0])).toContain("ticket-5-provider")
         expect(JSON.stringify(inputs[1])).toContain("ticket-5-provider")
         expect(JSON.stringify(inputs[2])).not.toContain("ticket-5-provider")
+        expect(toolNames(inputs[0])).toContain("skill")
+        expect(toolNames(inputs[1])).toContain("skill")
+        expect(toolNames(inputs[2])).not.toContain("skill")
         expect(JSON.stringify(inputs[2]?.messages)).toContain("test legacy allow")
         expect(JSON.stringify(inputs[2]?.messages)).toContain("test legacy ask")
       }),
