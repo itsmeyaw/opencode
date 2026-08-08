@@ -35,6 +35,7 @@ async function mountDialog(input: {
   fetch: typeof fetch
   agent?: string
   sessionID?: string
+  location?: { directory: string; workspaceID?: string }
   keybinds?: Partial<TuiKeybind.Keybinds>
   onSelect?: (skill: string) => void
 }) {
@@ -47,7 +48,12 @@ async function mountDialog(input: {
     const dialog = useDialog()
     onMount(() =>
       dialog.replace(() => (
-        <DialogSkill agent={agent()} sessionID={input.sessionID} onSelect={input.onSelect ?? (() => {})} />
+        <DialogSkill
+          agent={agent()}
+          sessionID={input.sessionID}
+          location={input.location ?? { directory }}
+          onSelect={input.onSelect ?? (() => {})}
+        />
       )),
     )
     return <Toast />
@@ -96,6 +102,7 @@ async function mountDialog(input: {
 test("shows authoritative skill permissions for the selected agent and Session", async () => {
   await using tmp = await tmpdir()
   const requests: URL[] = []
+  const requestLocation = { directory: "/tmp/moved", workspaceID: "wrk_test" }
   const fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
@@ -127,7 +134,13 @@ test("shows authoritative skill permissions for the selected agent and Session",
       ],
     })
   }) as typeof globalThis.fetch
-  const dialog = await mountDialog({ root: tmp.path, fetch, agent: "plan", sessionID: "ses_test" })
+  const dialog = await mountDialog({
+    root: tmp.path,
+    fetch,
+    agent: "plan",
+    sessionID: "ses_test",
+    location: requestLocation,
+  })
 
   try {
     await wait(() => {
@@ -144,7 +157,8 @@ test("shows authoritative skill permissions for the selected agent and Session",
     expect(requests).toHaveLength(1)
     expect(requests[0]?.searchParams.get("agent")).toBe("plan")
     expect(requests[0]?.searchParams.get("sessionID")).toBe("ses_test")
-    expect(requests[0]?.searchParams.get("location[directory]")).toBe(directory)
+    expect(requests[0]?.searchParams.get("location[directory]")).toBe(requestLocation.directory)
+    expect(requests[0]?.searchParams.get("location[workspace]")).toBe(requestLocation.workspaceID)
   } finally {
     await dialog.cleanup()
   }
@@ -153,6 +167,8 @@ test("shows authoritative skill permissions for the selected agent and Session",
 test("cycles the selected permission with Space and refreshes authoritative state", async () => {
   await using tmp = await tmpdir()
   const mutations: Array<{ agent: string; name: string; effect: string }> = []
+  const mutationLocations: URL[] = []
+  const requestLocation = { directory: "/tmp/moved", workspaceID: "wrk_test" }
   let reads = 0
   let effect = "ask"
   const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -162,6 +178,7 @@ test("cycles the selected permission with Space and refreshes authoritative stat
     if (request.method === "PUT") {
       const body = (await request.json()) as { agent: string; name: string; effect: string }
       mutations.push(body)
+      mutationLocations.push(url)
       effect = body.effect
       return json({ location, data: { name: body.name, effect: body.effect } })
     }
@@ -186,7 +203,7 @@ test("cycles the selected permission with Space and refreshes authoritative stat
       ],
     })
   }) as typeof globalThis.fetch
-  const dialog = await mountDialog({ root: tmp.path, fetch })
+  const dialog = await mountDialog({ root: tmp.path, fetch, location: requestLocation })
 
   try {
     await wait(() => dialog.app.captureCharFrame().includes("deploy"))
@@ -197,6 +214,8 @@ test("cycles the selected permission with Space and refreshes authoritative stat
     await dialog.app.flush()
     await wait(() => !dialog.app.captureCharFrame().includes("Loading"), "first cycle rendering")
     expect(mutations[0]).toEqual({ agent: "build", name: "deploy", effect: "allow" })
+    expect(mutationLocations[0]?.searchParams.get("location[directory]")).toBe(requestLocation.directory)
+    expect(mutationLocations[0]?.searchParams.get("location[workspace]")).toBe(requestLocation.workspaceID)
     expect(reads).toBe(2)
     expect(
       dialog.app
@@ -292,9 +311,49 @@ test("locks mutation input while loading and preserves authoritative state on fa
   }
 })
 
+test("keeps the authoritative mutation result when the list refresh fails", async () => {
+  await using tmp = await tmpdir()
+  let reads = 0
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
+    if (request.method === "PUT") {
+      return json({ location, data: { name: "review", effect: "allow" } })
+    }
+    reads++
+    if (reads > 1) return json({ message: "permission refresh unavailable" }, { status: 503 })
+    return json({
+      location,
+      data: [
+        {
+          name: "review",
+          description: "Review changes",
+          location: "/skills/review/SKILL.md",
+          content: "# Review",
+          effect: "ask",
+        },
+      ],
+    })
+  }) as typeof globalThis.fetch
+  const dialog = await mountDialog({ root: tmp.path, fetch })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"))
+    dialog.app.mockInput.pressKey(" ")
+    await wait(() => dialog.app.captureCharFrame().includes("permission refresh unavailable"))
+    const frame = dialog.app.captureCharFrame()
+    expect(frame.split("\n").find((line) => line.includes("review"))).toContain("Allowed")
+    expect(frame).toContain("Skill permission changed; refresh failed")
+  } finally {
+    await dialog.cleanup()
+  }
+})
+
 test("refreshes permissions when the selected agent changes before a Session exists", async () => {
   await using tmp = await tmpdir()
   const requests: URL[] = []
+  const requestLocation = { directory: "/tmp/baseline", workspaceID: "wrk_baseline" }
   const fetch = (async (input: RequestInfo | URL) => {
     const url = new URL(input instanceof Request ? input.url : String(input))
     if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
@@ -313,18 +372,101 @@ test("refreshes permissions when the selected agent changes before a Session exi
       ],
     })
   }) as typeof globalThis.fetch
-  const dialog = await mountDialog({ root: tmp.path, fetch })
+  const dialog = await mountDialog({ root: tmp.path, fetch, location: requestLocation })
 
   try {
     await wait(() => dialog.app.captureCharFrame().includes("Allowed"))
     expect(requests[0]?.searchParams.get("agent")).toBe("build")
     expect(requests[0]?.searchParams.has("sessionID")).toBe(false)
+    expect(requests[0]?.searchParams.get("location[directory]")).toBe(requestLocation.directory)
+    expect(requests[0]?.searchParams.get("location[workspace]")).toBe(requestLocation.workspaceID)
 
     dialog.setAgent("plan")
     await wait(() => requests.length === 2 && dialog.app.captureCharFrame().includes("Denied"))
     expect(requests[1]?.searchParams.get("agent")).toBe("plan")
     expect(requests[1]?.searchParams.has("sessionID")).toBe(false)
     expect(dialog.app.captureCharFrame()).toContain("Skills")
+  } finally {
+    await dialog.cleanup()
+  }
+})
+
+test("blocks cycling stale permissions while the selected agent refreshes", async () => {
+  await using tmp = await tmpdir()
+  let planReads = 0
+  let effect = "deny"
+  let finishPlan!: (response: Response) => void
+  const pendingPlan = new Promise<Response>((resolve) => {
+    finishPlan = resolve
+  })
+  const mutations: Array<{ agent: string; name: string; effect: string }> = []
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
+    if (request.method === "PUT") {
+      const body = (await request.json()) as { agent: string; name: string; effect: string }
+      mutations.push(body)
+      effect = body.effect
+      return json({ location, data: { name: body.name, effect: body.effect } })
+    }
+    if (url.searchParams.get("agent") === "plan") {
+      planReads++
+      if (planReads === 1) return pendingPlan
+      return json({
+        location,
+        data: [
+          {
+            name: "review",
+            description: "Review changes",
+            location: "/skills/review/SKILL.md",
+            content: "# Review",
+            effect,
+          },
+        ],
+      })
+    }
+    return json({
+      location,
+      data: [
+        {
+          name: "review",
+          description: "Review changes",
+          location: "/skills/review/SKILL.md",
+          content: "# Review",
+          effect: "allow",
+        },
+      ],
+    })
+  }) as typeof globalThis.fetch
+  const dialog = await mountDialog({ root: tmp.path, fetch })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Allowed"))
+    dialog.setAgent("plan")
+    await wait(() => planReads === 1, "plan permission request")
+    dialog.app.mockInput.pressKey(" ")
+    await Bun.sleep(20)
+    expect(mutations).toHaveLength(0)
+
+    finishPlan(
+      json({
+        location,
+        data: [
+          {
+            name: "review",
+            description: "Review changes",
+            location: "/skills/review/SKILL.md",
+            content: "# Review",
+            effect,
+          },
+        ],
+      }),
+    )
+    await wait(() => dialog.app.captureCharFrame().includes("Denied"))
+    dialog.app.mockInput.pressKey(" ")
+    await wait(() => mutations.length === 1 && dialog.app.captureCharFrame().includes("Ask"))
+    expect(mutations[0]).toEqual({ agent: "plan", name: "review", effect: "ask" })
   } finally {
     await dialog.cleanup()
   }

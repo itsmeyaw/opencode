@@ -208,6 +208,15 @@ export function Prompt(props: PromptProps) {
   const editorContextLabelState = createMemo(() => editor.labelState())
   const [auto, setAuto] = createSignal<AutocompleteRef>()
   const workspace = usePromptWorkspace(props.sessionID)
+  const skillLocation = createMemo(() => {
+    const current = location()
+    if (current) return current
+    const selected = workspace.selection()
+    return {
+      directory: sdk.directory ?? paths.cwd,
+      workspaceID: selected?.type === "existing" ? selected.workspaceID : undefined,
+    }
+  })
   const move = usePromptMove({ projectID: project.project, sessionID: () => props.sessionID })
   const [cursorVersion, setCursorVersion] = createSignal(0)
   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
@@ -524,6 +533,7 @@ export function Prompt(props: PromptProps) {
             <DialogSkill
               agent={local.agent.current()?.name ?? agent.name}
               sessionID={props.sessionID}
+              location={skillLocation()}
               onSelect={(skill) => {
                 input.setText(`/${skill} `)
                 setStore("prompt", {
