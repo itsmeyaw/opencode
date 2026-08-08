@@ -4,7 +4,9 @@ import { makeLocationNode } from "../effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
 import { AgentV2 } from "../agent"
 import { PermissionV2 } from "../permission"
+import { SkillPermission } from "../permission/skill"
 import { SkillV2 } from "../skill"
+import { SessionV2 } from "../session"
 import { SystemContext } from "../system-context/index"
 
 const Summary = Schema.Struct({
@@ -32,7 +34,7 @@ const render = (skills: ReadonlyArray<Summary>) =>
   ].join("\n")
 
 export interface Interface {
-  readonly load: (agent: AgentV2.Selection) => Effect.Effect<SystemContext.SystemContext>
+  readonly load: (agent: AgentV2.Selection, sessionID?: SessionV2.ID) => Effect.Effect<SystemContext.SystemContext>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SkillGuidance") {}
@@ -41,12 +43,22 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skills = yield* SkillV2.Service
+    const permissions = yield* SkillPermission.Service
 
     return Service.of({
-      load: Effect.fn("SkillGuidance.load")(function* (selection) {
+      load: Effect.fn("SkillGuidance.load")(function* (selection, sessionID?: SessionV2.ID) {
         const agent = selection.info
         if (!agent) return SystemContext.empty
-        const permitted = SkillV2.available(yield* skills.list(), agent)
+        const discovered = yield* skills.list()
+        const resolution = yield* permissions.resolve({
+          agent: agent.id,
+          sessionID,
+          names: discovered.map((skill) => skill.name),
+        }).pipe(Effect.orDie)
+        const effects = new Map(resolution.states.map((state) => [state.name, state.effect]))
+        const permitted = discovered.filter(
+          (skill) => (effects.get(skill.name) ?? PermissionV2.evaluate("skill", skill.name, agent.permissions).effect) !== "deny",
+        )
         if (permitted.length === 0 && PermissionV2.evaluate("skill", "*", agent.permissions).effect === "deny")
           return SystemContext.empty
         const available = permitted
@@ -73,4 +85,4 @@ const layer = Layer.effect(
 
 export const locationLayer = layer
 
-export const node = makeLocationNode({ service: Service, layer, deps: [SkillV2.node] })
+export const node = makeLocationNode({ service: Service, layer, deps: [SkillV2.node, SkillPermission.node] })

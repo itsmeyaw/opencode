@@ -5,6 +5,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SkillV2 } from "@opencode-ai/core/skill"
+import { SkillPermission } from "@opencode-ai/core/permission/skill"
 import { SystemContext } from "@opencode-ai/core/system-context"
 import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
 import { it } from "../lib/effect"
@@ -28,9 +29,13 @@ const denied = SkillV2.Info.make({
   content: "Denied guidance",
 })
 
-const layer = (list: () => SkillV2.Info[]) =>
+const layer = (
+  list: () => SkillV2.Info[],
+  resolve: () => SkillPermission.Resolution = () => ({ agent: build, states: [], rules: [] }),
+) =>
   AppNodeBuilder.build(SkillGuidance.node, [
     [SkillV2.node, Layer.mock(SkillV2.Service, { list: () => Effect.succeed(list()) })],
+    [SkillPermission.node, Layer.mock(SkillPermission.Service, { resolve: () => Effect.succeed(resolve()) })],
   ])
 
 describe("SkillGuidance", () => {
@@ -140,5 +145,44 @@ describe("SkillGuidance", () => {
         snapshot: {},
       })
     }).pipe(Effect.provide(layer(() => [effect])))
+  })
+
+  it.effect("reconciles runtime permission changes without replacing the baseline", () => {
+    let permission: "allow" | "ask" | "deny" = "allow"
+    return Effect.gen(function* () {
+      const guidance = yield* SkillGuidance.Service
+      const initialized = yield* guidance
+        .load({ id: build, info: AgentV2.Info.empty(build) })
+        .pipe(Effect.flatMap(SystemContext.initialize))
+
+      expect(initialized.baseline).toContain("<name>effect</name>")
+      permission = "ask"
+      expect(
+        yield* guidance
+          .load({ id: build, info: AgentV2.Info.empty(build) })
+          .pipe(Effect.flatMap((context) => SystemContext.reconcile(context, initialized.snapshot))),
+      ).toEqual({ _tag: "Unchanged" })
+
+      permission = "deny"
+      const reconciled = yield* guidance
+        .load({ id: build, info: AgentV2.Info.empty(build) })
+        .pipe(Effect.flatMap((context) => SystemContext.reconcile(context, initialized.snapshot)))
+      expect(reconciled).toMatchObject({
+        _tag: "Updated",
+        text: expect.not.stringContaining("<name>effect</name>"),
+      })
+      expect(initialized.baseline).toContain("<name>effect</name>")
+    }).pipe(
+      Effect.provide(
+        layer(
+          () => [effect],
+          () => ({
+            agent: build,
+            states: [{ name: effect.name, effect: permission }],
+            rules: [],
+          }),
+        ),
+      ),
+    )
   })
 })
