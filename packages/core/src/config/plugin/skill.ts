@@ -8,15 +8,44 @@ import { AbsolutePath } from "../../schema"
 import { SkillV2 } from "../../skill"
 import { Global } from "../../global"
 import { Location } from "../../location"
+import { FSUtil } from "../../fs-util"
+import { truthy } from "../../flag/flag"
 
 export const Plugin = define({
   id: "config-skill",
   effect: Effect.fn(function* (ctx) {
     const config = yield* Config.Service
+    const fs = yield* FSUtil.Service
     const global = yield* Global.Service
     const location = yield* Location.Service
     yield* ctx.skill.transform(
       Effect.fn(function* (draft) {
+        if (!truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS")) {
+          const names = [
+            ...(!truthy("OPENCODE_DISABLE_CLAUDE_CODE") && !truthy("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS")
+              ? [".claude"]
+              : []),
+            ".agents",
+          ]
+          for (const name of names) {
+            draft.source(
+              SkillV2.DirectorySource.make({
+                type: "directory",
+                path: AbsolutePath.make(path.join(global.home, name, "skills")),
+              }),
+            )
+          }
+          for (const directory of yield* fs
+            .up({ targets: names, start: location.directory, stop: location.project.directory })
+            .pipe(Effect.catch(() => Effect.succeed([] as string[])))) {
+            draft.source(
+              SkillV2.DirectorySource.make({
+                type: "directory",
+                path: AbsolutePath.make(path.join(directory, "skills")),
+              }),
+            )
+          }
+        }
         const entries = yield* config.entries()
         const directories = entries.flatMap((entry) => (entry.type === "directory" ? [entry.path] : []))
         const items = entries.flatMap((entry) => (entry.type === "document" ? (entry.info.skills ?? []) : []))

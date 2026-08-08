@@ -3,6 +3,8 @@ import { describe, expect } from "bun:test"
 import { Effect, Layer, Schema } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigSkillPlugin } from "@opencode-ai/core/config/plugin/skill"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -56,9 +58,18 @@ describe("ConfigSkillPlugin.Plugin", () => {
               ]),
           }),
         ),
+        Effect.provide(AppNodeBuilder.build(FSUtil.node)),
       )
 
       expect(sources).toEqual([
+        SkillV2.DirectorySource.make({
+          type: "directory",
+          path: AbsolutePath.make(path.join("/home/test", ".claude", "skills")),
+        }),
+        SkillV2.DirectorySource.make({
+          type: "directory",
+          path: AbsolutePath.make(path.join("/home/test", ".agents", "skills")),
+        }),
         SkillV2.DirectorySource.make({
           type: "directory",
           path: AbsolutePath.make(path.join("/repo/.opencode", "skill")),
