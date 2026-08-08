@@ -758,29 +758,57 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
     directory: tmp.path,
     fetch: opencode.transport.fetch,
   })
+  const requests: Array<{ url: URL; method: string; body?: { agent: string; name: string; effect: string } }> = []
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const body =
+      request.method === "PUT"
+        ? ((await request.clone().json()) as { agent: string; name: string; effect: string })
+        : undefined
+    requests.push({ url: new URL(request.url), method: request.method, body })
+    return opencode.transport.fetch(request)
+  }) as typeof globalThis.fetch
+  const selected: string[] = []
   const dialog = await mountDialog({
     root: tmp.path,
-    fetch: opencode.transport.fetch,
+    fetch,
     events: {
       subscribe: (handler) => opencode.transport.events.subscribe((event) => handler(event as GlobalEvent)),
     },
     location,
     sessionID: session.id,
+    onSelect: (skill) => selected.push(skill),
   })
 
   try {
     await wait(() => dialog.app.captureCharFrame().includes("Denied"), "embedded authoritative read")
     await wait(() => dialog.app.captureCharFrame().includes("customize-opencode"), "embedded builtin skill")
+    await wait(() => requests.some((request) => request.method === "GET"), "embedded permission request")
+    const read = requests.find((request) => request.method === "GET")
+    expect(read?.url.pathname).toBe("/api/skill/permission")
+    expect(read?.url.searchParams.get("agent")).toBe("build")
+    expect(read?.url.searchParams.get("sessionID")).toBe(session.id)
+    expect(read?.url.searchParams.get("location[directory]")).toBe(tmp.path)
+    expect(read?.url.searchParams.has("location[workspace]")).toBe(false)
+
+    dialog.app.mockInput.pressArrow("down")
+    dialog.app.mockInput.pressKey(" ")
+    await wait(() => requests.some((request) => request.method === "PUT"), "embedded physical mutation")
+    const mutation = requests.find((request) => request.method === "PUT")
+    expect(mutation?.url.pathname).toBe("/api/skill/permission")
+    expect(mutation?.url.searchParams.get("location[directory]")).toBe(tmp.path)
+    expect(mutation?.url.searchParams.has("sessionID")).toBe(false)
+    expect(mutation?.url.searchParams.get("location[workspace]")).toBeNull()
+    expect(mutation?.body).toEqual({ agent: "build", name: "agent-eval", effect: "ask" })
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"), "embedded mutation refresh")
     await external.v2.skill.permission.set(
-      { agent: "build", name: "customize-opencode", effect: "allow" },
+      { agent: "build", name: "agent-eval", effect: "allow" },
       { throwOnError: true },
     )
-    await wait(() => dialog.app.captureCharFrame().includes("Allowed"), "embedded mutation refresh")
-    await external.v2.skill.permission.set(
-      { agent: "build", name: "customize-opencode", effect: "ask" },
-      { throwOnError: true },
-    )
-    await wait(() => dialog.app.captureCharFrame().includes("Ask"), "embedded external refresh")
+    await wait(() => dialog.app.captureCharFrame().includes("Allowed"), "embedded external refresh")
+    dialog.app.mockInput.pressEnter()
+    await wait(() => selected.length === 1, "embedded selection")
+    expect(selected).toEqual(["agent-eval"])
   } finally {
     await dialog.cleanup()
     await Effect.runPromise(Scope.close(scope, Exit.void))
