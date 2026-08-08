@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
 import type { Agent } from "../../src/agent/agent"
@@ -44,7 +45,7 @@ const build: Agent.Info = {
 }
 
 const it = testEffect(
-  LayerNode.compile(SystemPrompt.node, [
+  AppNodeBuilder.build(SystemPrompt.node, [
     [
       MCP.node,
       Layer.mock(MCP.Service, {

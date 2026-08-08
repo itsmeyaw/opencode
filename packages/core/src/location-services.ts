@@ -1,4 +1,4 @@
-import { Effect, Layer, LayerMap } from "effect"
+import { Effect, Layer, LayerMap, RcMap } from "effect"
 import { AgentV2 } from "./agent"
 import { AISDK } from "./aisdk"
 import { Catalog } from "./catalog"
@@ -10,6 +10,7 @@ import { FileMutation } from "./file-mutation"
 import { FileSystem } from "./filesystem"
 import { FileSystemSearch } from "./filesystem/search"
 import { Watcher } from "./filesystem/watcher"
+import { FSUtil } from "./fs-util"
 import { Image } from "./image"
 import { Integration } from "./integration"
 import { Location } from "./location"
@@ -29,6 +30,7 @@ import { SessionRunnerModel } from "./session/runner/model"
 import { SessionTodo } from "./session/todo"
 import { SkillV2 } from "./skill"
 import { SkillGuidance } from "./skill/guidance"
+import { AbsolutePath } from "./schema"
 import { Snapshot } from "./snapshot"
 import { SystemContextBuiltIns } from "./system-context/builtins"
 import { SystemContextRegistry } from "./system-context/registry"
@@ -86,28 +88,49 @@ export function buildLocationServiceMap(
 ): Layer.Layer<LocationServiceMap.Service> {
   return Layer.effect(
     LocationServiceMap.Service,
-    LayerMap.make(
-      (ref: Location.Ref) => {
-        const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
-        // Apply replacements during hoist, not afterward: replacements can
-        // introduce new tagged dependencies (Location.boundNode depends on
-        // Project), and the hoist walk is the only pass that can still slice
-        // those back out.
-        const location = LayerNode.hoist(locationServices, Node.tags.values.global, allReplacements)
+    Effect.gen(function* () {
+      const locations = yield* LayerMap.make(
+        (ref: Location.Ref) => {
+          const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
+          // Apply replacements during hoist, not afterward: replacements can
+          // introduce new tagged dependencies (Location.boundNode depends on
+          // Project), and the hoist walk is the only pass that can still slice
+          // those back out.
+          const location = LayerNode.hoist(locationServices, Node.tags.values.global, allReplacements)
 
-        return LayerNode.compile(location.node).pipe(
-          Layer.fresh,
-          Layer.tap(() =>
-            Effect.logInfo("booting location services", {
-              directory: ref.directory,
-              workspaceID: ref.workspaceID,
-            }),
-          ),
-          Layer.provide(LayerNode.compile(location.hoisted)),
-        )
-      },
-      { idleTimeToLive: "60 minutes" },
-    ),
+          return LayerNode.compile(location.node).pipe(
+            Layer.fresh,
+            Layer.tap(() =>
+              Effect.logInfo("booting location services", {
+                directory: ref.directory,
+                workspaceID: ref.workspaceID,
+              }),
+            ),
+            Layer.provide(LayerNode.compile(location.hoisted)),
+          )
+        },
+        { idleTimeToLive: "60 minutes" },
+      )
+      const normalizeDirectory = (directory: Location.Ref["directory"]) => AbsolutePath.make(FSUtil.resolve(directory))
+      const normalize = (ref: Location.Ref) =>
+        Location.Ref.make({ directory: normalizeDirectory(ref.directory), workspaceID: ref.workspaceID })
+      return {
+        ...locations,
+        get: (ref: Location.Ref) => locations.get(normalize(ref)),
+        contextEffect: (ref: Location.Ref) => locations.contextEffect(normalize(ref)),
+        invalidate: (ref: Location.Ref) => locations.invalidate(normalize(ref)),
+        invalidateDirectory: (directory: Location.Ref["directory"]) =>
+          Effect.gen(function* () {
+            const normalized = normalizeDirectory(directory)
+            const refs = yield* RcMap.keys(locations.rcMap)
+            yield* Effect.forEach(
+              Array.from(refs).filter((ref) => ref.directory === normalized),
+              (ref) => locations.invalidate(ref),
+              { concurrency: "unbounded", discard: true },
+            )
+          }),
+      }
+    }),
   )
 }
 

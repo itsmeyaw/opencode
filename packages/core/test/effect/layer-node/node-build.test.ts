@@ -5,7 +5,6 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
-import type { LocationError, LocationServices } from "@opencode-ai/core/location-services"
 import { Project } from "@opencode-ai/core/project"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { tmpdir } from "../../fixture/tmpdir"
@@ -49,7 +48,7 @@ describe("node build", () => {
       LocationServiceMap.Service,
       Effect.gen(function* () {
         const service = yield* CycleB
-        return yield* LayerMap.make(
+        const locations = yield* LayerMap.make(
           (ref: Location.Ref) =>
             Layer.succeed(
               Location.Service,
@@ -61,7 +60,8 @@ describe("node build", () => {
             ),
           { idleTimeToLive: "1 minute" },
         )
-      }) as unknown as Effect.Effect<LayerMap.LayerMap<Location.Ref, LocationServices, LocationError>, never, CycleB>,
+        return { ...locations, invalidateDirectory: () => Effect.void }
+      }) as unknown as Effect.Effect<LocationServiceMap.Interface, never, CycleB>,
     )
     const map = Node.makeGlobalNode({ service: LocationServiceMap.Service, layer: mapLayer, deps: [b] })
     expect(() => AppNodeBuilder.build(LayerNode.group([a]), [[LocationServiceMap.node, map]])).toThrow(

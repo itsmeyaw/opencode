@@ -3,6 +3,8 @@ import type { InstanceContext } from "@/project/instance-context"
 import { InstanceRef, WorkspaceRef } from "./instance-ref"
 import { registerDisposer } from "./instance-registry"
 import { WorkspaceContext } from "@/control-plane/workspace-context"
+import { Location } from "@opencode-ai/core/location"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 
 const TypeId = "~opencode/InstanceState"
 
@@ -22,6 +24,13 @@ export const workspaceID = Effect.gen(function* () {
 })
 
 export const directory = Effect.map(context, (ctx) => ctx.directory)
+
+export const location = Effect.gen(function* () {
+  return Location.Ref.make({
+    directory: AbsolutePath.make((yield* context).directory),
+    workspaceID: yield* workspaceID,
+  })
+})
 
 export const make = <A, E = never, R = never>(
   init: (ctx: InstanceContext) => Effect.Effect<A, E, R | Scope.Scope>,
