@@ -736,54 +736,74 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
   await using tmp = await tmpdir()
   const database = Flag.OPENCODE_DB
   const config = process.env.OPENCODE_CONFIG_DIR
+  const scope = Effect.runSync(Scope.make())
   Flag.OPENCODE_DB = path.join(tmp.path, "opencode.sqlite")
   process.env.OPENCODE_CONFIG_DIR = path.join(tmp.path, "config")
-  const { AbsolutePath, Agent, OpenCode } = await import("@opencode-ai/sdk-next")
-  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
-  const scope = Effect.runSync(Scope.make())
-  const opencode = await Effect.runPromise(OpenCode.create().pipe(Effect.provideService(Scope.Scope, scope)))
-  Bun.spawnSync(["git", "init", tmp.path])
-  await Bun.write(path.join(tmp.path, "opencode.json"), JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }))
-  await mkdir(path.join(tmp.path, ".opencode", "skills", "embedded"), { recursive: true })
-  await Bun.write(
-    path.join(tmp.path, ".opencode", "skills", "embedded", "SKILL.md"),
-    "---\nname: embedded-transport\ndescription: Embedded transport skill\n---\n# Embedded",
-  )
-  const location = { directory: tmp.path }
-  const session = await Effect.runPromise(
-    opencode.sessions.create({ location: { directory: AbsolutePath.make(tmp.path) }, agent: Agent.ID.make("build") }),
-  )
-  const external = createOpencodeClient({
-    baseUrl: "http://opencode.local",
-    directory: tmp.path,
-    fetch: opencode.transport.fetch,
-  })
-  const requests: Array<{ url: URL; method: string; body?: { agent: string; name: string; effect: string } }> = []
-  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = input instanceof Request ? input : new Request(input, init)
-    const body =
-      request.method === "PUT"
-        ? ((await request.clone().json()) as { agent: string; name: string; effect: string })
-        : undefined
-    requests.push({ url: new URL(request.url), method: request.method, body })
-    return opencode.transport.fetch(request)
-  }) as typeof globalThis.fetch
-  const selected: string[] = []
-  const dialog = await mountDialog({
-    root: tmp.path,
-    fetch,
-    events: {
-      subscribe: (handler) => opencode.transport.events.subscribe((event) => handler(event as GlobalEvent)),
-    },
-    location,
-    sessionID: session.id,
-    onSelect: (skill) => selected.push(skill),
-  })
+  let cleanup: (() => Promise<void>) | undefined
 
   try {
-    await wait(() => dialog.app.captureCharFrame().includes("Denied"), "embedded authoritative read")
+    const { AbsolutePath, Agent, OpenCode } = await import("@opencode-ai/sdk-next")
+    const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
+    Bun.spawnSync(["git", "init", tmp.path])
+    await Bun.write(
+      path.join(tmp.path, "opencode.json"),
+      JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
+    )
+    await mkdir(path.join(tmp.path, ".opencode", "skills", "embedded"), { recursive: true })
+    await Bun.write(
+      path.join(tmp.path, ".opencode", "skills", "embedded", "SKILL.md"),
+      "---\nname: embedded-transport\ndescription: Embedded transport skill\n---\n# Embedded",
+    )
+    const opencode = await Effect.runPromise(OpenCode.create().pipe(Effect.provideService(Scope.Scope, scope)))
+    const location = { directory: tmp.path }
+    const session = await Effect.runPromise(
+      opencode.sessions.create({ location: { directory: AbsolutePath.make(tmp.path) }, agent: Agent.ID.make("build") }),
+    )
+    const external = createOpencodeClient({
+      baseUrl: "http://opencode.local",
+      directory: tmp.path,
+      fetch: opencode.transport.fetch,
+    })
+    const requests: Array<{
+      url: URL
+      method: string
+      body?: { agent: string; name: string; effect: string }
+      settled: boolean
+    }> = []
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      const entry = {
+        url: new URL(request.url),
+        method: request.method,
+        body:
+          request.method === "PUT"
+            ? ((await request.clone().json()) as { agent: string; name: string; effect: string })
+            : undefined,
+        settled: false,
+      }
+      requests.push(entry)
+      const response = await opencode.transport.fetch(request)
+      entry.settled = true
+      return response
+    }) as typeof globalThis.fetch
+    const selected: string[] = []
+    const dialog = await mountDialog({
+      root: tmp.path,
+      fetch,
+      events: {
+        subscribe: (handler) => opencode.transport.events.subscribe((event) => handler(event as GlobalEvent)),
+      },
+      location,
+      sessionID: session.id,
+      onSelect: (skill) => selected.push(skill),
+    })
+    cleanup = dialog.cleanup
+
+    await wait(
+      () => requests.some((request) => request.method === "GET" && request.settled),
+      "embedded authoritative read",
+    )
     await wait(() => dialog.app.captureCharFrame().includes("customize-opencode"), "embedded builtin skill")
-    await wait(() => requests.some((request) => request.method === "GET"), "embedded permission request")
     const read = requests.find((request) => request.method === "GET")
     expect(read?.url.pathname).toBe("/api/skill/permission")
     expect(read?.url.searchParams.get("agent")).toBe("build")
@@ -810,7 +830,7 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
     await wait(() => selected.length === 1, "embedded selection")
     expect(selected).toEqual(["agent-eval"])
   } finally {
-    await dialog.cleanup()
+    await cleanup?.()
     await Effect.runPromise(Scope.close(scope, Exit.void))
     Flag.OPENCODE_DB = database
     if (config === undefined) delete process.env.OPENCODE_CONFIG_DIR
