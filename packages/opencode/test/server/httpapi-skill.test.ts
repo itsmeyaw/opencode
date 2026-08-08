@@ -9,7 +9,7 @@ import Http from "node:http"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
-import { TestLLMServer } from "../lib/llm-server"
+import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 
 const it = testEffect(TestLLMServer.layer)
@@ -1331,20 +1331,36 @@ describe.serial("skill HttpApi", () => {
         const agentSession = yield* create(firstSdk, "Legacy other agent")
         const similarSession = yield* create(firstSdk, "Legacy similar skill")
         const locationSession = yield* create(secondSdk, "Legacy other location")
-        const raced = yield* prompt(
-          firstSdk,
-          firstSession.data.id,
-          "build",
-          "Legacy exact reply race",
-          "skill",
-          "skill",
-          { name: "ticket-6-legacy-exact*" },
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy exact reply race"),
+          reply().tool("skill", { name: "ticket-6-legacy-exact*" }).tool("bash", { command: "echo pending" }).item(),
         )
-        const unrelated = yield* Effect.promise(() =>
-          firstSdk.v2.session.permission.create(
-            { sessionID: firstSession.data.id, agent: "build", action: "bash", resources: ["echo pending"] },
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy exact reply race"),
+          "Legacy exact reply race completed",
+        )
+        const racedRunning = yield* Effect.promise(() =>
+          firstSdk.session.prompt(
+            {
+              sessionID: firstSession.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "Legacy exact reply race" }],
+            },
             { throwOnError: true },
           ),
+        ).pipe(Effect.forkScoped)
+        const raced = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === firstSession.data.id && item.permission === "skill")),
+          ),
+          "Legacy exact reply race request did not become pending",
+        )
+        const unrelated = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === firstSession.data.id && item.permission === "bash")),
+          ),
+          "Legacy unrelated action request did not become pending",
         )
         const sibling = yield* prompt(
           firstSdk,
@@ -1383,26 +1399,26 @@ describe.serial("skill HttpApi", () => {
           { name: "ticket-6-legacy-exact*" },
         )
 
-        // A once reply wins the controlled race, so the subsequent runtime update cannot save or fan out the approval.
-        yield* Effect.promise(() =>
-          firstSdk.permission.reply({ requestID: raced.request.id, reply: "once" }, { throwOnError: true }),
+        const release = Promise.withResolvers<void>()
+        const race = Effect.promise(() =>
+          Promise.all([
+            release.promise.then(() =>
+              firstSdk.permission.reply({ requestID: raced.id, reply: "once" }, { throwOnError: true }),
+            ),
+            release.promise.then(() =>
+              firstSdk.v2.skill.permission.set(
+                { agent: "build", name: "ticket-6-legacy-exact*", effect: "allow" },
+                { throwOnError: true },
+              ),
+            ),
+          ]),
         )
-        yield* Effect.promise(() =>
-          firstSdk.v2.skill.permission.set(
-            { agent: "build", name: "ticket-6-legacy-exact*", effect: "allow" },
-            { throwOnError: true },
-          ),
-        )
-        yield* Fiber.join(raced.running)
+        release.resolve()
+        yield* race
         yield* Fiber.join(sibling.running)
         const pending = yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))
-        expect(pending.data.map((item) => item.id)).toEqual(expect.arrayContaining([otherAgent.request.id, similar.request.id]))
+        expect(pending.data.map((item) => item.id)).toEqual(expect.arrayContaining([unrelated.id, otherAgent.request.id, similar.request.id]))
         expect(pending.data.map((item) => item.id)).not.toContain(sibling.request.id)
-        expect(
-          (yield* Effect.promise(() =>
-            firstSdk.v2.session.permission.list({ sessionID: firstSession.data.id }, { throwOnError: true }),
-          )).data.data.map((item) => item.id),
-        ).toContain(unrelated.data.data.id)
         const otherLocationPending = yield* Effect.promise(() => secondSdk.permission.list(undefined, { throwOnError: true }))
         expect(otherLocationPending.data.map((item) => item.id)).toContain(otherLocation.request.id)
 
@@ -1432,6 +1448,12 @@ describe.serial("skill HttpApi", () => {
           ),
         )
         yield* Fiber.join(after.running)
+        expect((yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))).data.map((item) => item.id)).toContain(
+          unrelated.id,
+        )
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: unrelated.id, reply: "once" }, { throwOnError: true }),
+        )
         yield* Effect.promise(() =>
           firstSdk.permission.reply({ requestID: otherAgent.request.id, reply: "once" }, { throwOnError: true }),
         )
@@ -1450,13 +1472,14 @@ describe.serial("skill HttpApi", () => {
         yield* Fiber.join(otherAgent.running)
         yield* Fiber.join(similar.running)
         yield* Fiber.join(otherLocation.running)
+        yield* Fiber.join(racedRunning)
 
         yield* pollWithTimeout(
           Effect.sync(() =>
             observed.some(
               (event) =>
                 (event as { type?: string; properties?: { requestID?: string } }).type === "permission.replied" &&
-                (event as { properties?: { requestID?: string } }).properties?.requestID === raced.request.id,
+                (event as { properties?: { requestID?: string } }).properties?.requestID === raced.id,
             )
               ? true
               : undefined,
@@ -1468,7 +1491,7 @@ describe.serial("skill HttpApi", () => {
         const replies = observed.filter(
           (event) =>
             (event as { type?: string; properties?: { requestID?: string } }).type === "permission.replied" &&
-            (event as { properties?: { requestID?: string } }).properties?.requestID === raced.request.id,
+            (event as { properties?: { requestID?: string } }).properties?.requestID === raced.id,
         )
         expect(replies, JSON.stringify(observed)).toHaveLength(1)
         controller.abort()
