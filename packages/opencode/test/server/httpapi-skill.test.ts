@@ -1429,17 +1429,36 @@ describe.serial("skill HttpApi", () => {
           ),
         )
         const afterSession = yield* create(firstSdk, "Legacy no saved approval")
-        const after = yield* prompt(
-          firstSdk,
-          afterSession.data.id,
-          "build",
-          "Legacy no saved approval",
-          "skill",
-          "skill",
-          { name: "ticket-6-legacy-exact*" },
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy no saved approval"),
+          reply().tool("skill", { name: "ticket-6-legacy-exact*" }).tool("bash", { command: "echo pending" }).item(),
         )
-        expect((yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))).data.map((item) => item.id)).toContain(
-          after.request.id,
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy no saved approval"),
+          "Legacy no saved approval completed",
+        )
+        const afterRunning = yield* Effect.promise(() =>
+          firstSdk.session.prompt(
+            {
+              sessionID: afterSession.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "Legacy no saved approval" }],
+            },
+            { throwOnError: true },
+          ),
+        ).pipe(Effect.forkScoped)
+        const after = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === afterSession.data.id && item.permission === "skill")),
+          ),
+          "Legacy no saved approval request did not become pending",
+        )
+        const afterUnrelated = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === afterSession.data.id && item.permission === "bash")),
+          ),
+          "Legacy no saved approval unrelated request did not become pending",
         )
         yield* Effect.promise(() =>
           firstSdk.v2.skill.permission.set(
@@ -1447,12 +1466,11 @@ describe.serial("skill HttpApi", () => {
             { throwOnError: true },
           ),
         )
-        yield* Fiber.join(after.running)
-        expect((yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))).data.map((item) => item.id)).toContain(
-          unrelated.id,
-        )
+        const afterPending = yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))
+        expect(afterPending.data.map((item) => item.id)).not.toContain(after.id)
+        expect(afterPending.data.map((item) => item.id)).toContain(afterUnrelated.id)
         yield* Effect.promise(() =>
-          firstSdk.permission.reply({ requestID: unrelated.id, reply: "once" }, { throwOnError: true }),
+          firstSdk.permission.reply({ requestID: afterUnrelated.id, reply: "once" }, { throwOnError: true }),
         )
         yield* Effect.promise(() =>
           firstSdk.permission.reply({ requestID: otherAgent.request.id, reply: "once" }, { throwOnError: true }),
@@ -1472,7 +1490,11 @@ describe.serial("skill HttpApi", () => {
         yield* Fiber.join(otherAgent.running)
         yield* Fiber.join(similar.running)
         yield* Fiber.join(otherLocation.running)
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: unrelated.id, reply: "once" }, { throwOnError: true }),
+        )
         yield* Fiber.join(racedRunning)
+        yield* Fiber.join(afterRunning)
 
         yield* pollWithTimeout(
           Effect.sync(() =>
