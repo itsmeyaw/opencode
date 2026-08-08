@@ -218,6 +218,23 @@ const layer = Layer.effect(
           yield* events
             .publish(Event.Asked, request)
             .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))
+          if (request.action !== "skill") return item
+          const result = yield* evaluateInput({ ...request, agent })
+          if (result.effect === "ask") return item
+          const existing = pending.get(request.id)
+          if (!existing) return item
+          pending.delete(request.id)
+          const reply = result.effect === "allow" ? "once" : "reject"
+          yield* events.publish(Event.Replied, {
+            sessionID: existing.request.sessionID,
+            requestID: existing.request.id,
+            reply,
+          })
+          if (reply === "once") {
+            yield* Deferred.succeed(existing.deferred, undefined)
+            return item
+          }
+          yield* Deferred.fail(existing.deferred, new DeclinedError())
           return item
         }),
       )
