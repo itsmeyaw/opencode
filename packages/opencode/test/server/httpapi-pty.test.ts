@@ -11,6 +11,8 @@ import * as Socket from "effect/unstable/socket/Socket"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Pty } from "@opencode-ai/core/pty"
 import { testEffect } from "../lib/effect"
+import { Location } from "@opencode-ai/core/location"
+import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 
 const testPty = process.platform === "win32" ? test.skip : test
 
@@ -134,6 +136,118 @@ describe("pty HttpApi bridge", () => {
       ptyID: info.id,
       message: `PTY session not found: ${info.id}`,
     })
+  })
+
+  testPty("shares PTY state with canonical routes in the same Location", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const headers = { "x-opencode-directory": tmp.path }
+    const created = await app().request(PtyPaths.create, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "sleep 5"], title: "shared" }),
+    })
+    expect(created.status).toBe(200)
+    const info = await created.json()
+
+    try {
+      const found = await app().request(`/api/pty/${info.id}`, { headers })
+      expect(found.status).toBe(200)
+      expect(Schema.decodeUnknownSync(Location.response(Pty.Info))(await found.json()).data).toMatchObject({
+        id: info.id,
+        title: "shared",
+      })
+    } finally {
+      await app().request(PtyPaths.remove.replace(":ptyID", info.id), { method: "DELETE", headers })
+    }
+  })
+
+  testPty("shares workspace-qualified PTY state and isolates other Locations", async () => {
+    await using first = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    await using second = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const workspaceID = WorkspaceV2.ID.create()
+    const otherWorkspaceID = WorkspaceV2.ID.create()
+    const headers = {
+      "x-opencode-directory": first.path,
+      "x-opencode-workspace": workspaceID,
+    }
+    const created = await app().request(PtyPaths.create, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "sleep 5"], title: "workspace" }),
+    })
+    expect(created.status).toBe(200)
+    const info = await created.json()
+
+    try {
+      expect((await app().request(`/api/pty/${info.id}`, { headers })).status).toBe(200)
+      expect(
+        (
+          await app().request(`/api/pty/${info.id}`, {
+            headers: { ...headers, "x-opencode-workspace": otherWorkspaceID },
+          })
+        ).status,
+      ).toBe(404)
+      expect(
+        (
+          await app().request(`/api/pty/${info.id}`, {
+            headers: { ...headers, "x-opencode-directory": second.path },
+          })
+        ).status,
+      ).toBe(404)
+    } finally {
+      await app().request(PtyPaths.remove.replace(":ptyID", info.id), { method: "DELETE", headers })
+    }
+  })
+
+  testPty("resets workspace-qualified PTY state when the legacy instance is disposed", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const headers = { "x-opencode-directory": tmp.path }
+    const workspaceID = WorkspaceV2.ID.create()
+    const location = `location[directory]=${encodeURIComponent(tmp.path)}&location[workspace]=${workspaceID}`
+
+    const created = await app().request(`/api/pty?${location}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "sleep 5"], title: "disposed" }),
+    })
+    expect(created.status).toBe(200)
+    const info = Schema.decodeUnknownSync(Location.response(Pty.Info))(await created.json()).data
+
+    try {
+      const disposed = await app().request("/instance/dispose", { method: "POST", headers })
+      expect(disposed.status).toBe(200)
+
+      const list = await app().request(`/api/pty?${location}`)
+      expect(list.status).toBe(200)
+      expect(Schema.decodeUnknownSync(Location.response(Schema.Array(Pty.Info)))(await list.json()).data).toEqual([])
+    } finally {
+      await app().request(`/api/pty/${info.id}?${location}`, { method: "DELETE" })
+    }
+  })
+
+  testPty("resets workspace-qualified PTY state when the legacy instance reloads", async () => {
+    await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
+    const headers = { "x-opencode-directory": tmp.path }
+    const workspaceID = WorkspaceV2.ID.create()
+    const location = `location[directory]=${encodeURIComponent(tmp.path)}&location[workspace]=${workspaceID}`
+    const created = await app().request(`/api/pty?${location}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "/usr/bin/env", args: ["sh", "-c", "sleep 5"], title: "reloaded" }),
+    })
+    expect(created.status).toBe(200)
+    const info = Schema.decodeUnknownSync(Location.response(Pty.Info))(await created.json()).data
+
+    try {
+      const reloaded = await app().request("/project/git/init", { method: "POST", headers })
+      expect(reloaded.status).toBe(200)
+
+      const list = await app().request(`/api/pty?${location}`)
+      expect(list.status).toBe(200)
+      expect(Schema.decodeUnknownSync(Location.response(Schema.Array(Pty.Info)))(await list.json()).data).toEqual([])
+    } finally {
+      await app().request(`/api/pty/${info.id}?${location}`, { method: "DELETE" })
+    }
   })
 
   testPty("hides exited sessions on the legacy surface", async () => {

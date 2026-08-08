@@ -86,28 +86,65 @@ export function buildLocationServiceMap(
 ): Layer.Layer<LocationServiceMap.Service> {
   return Layer.effect(
     LocationServiceMap.Service,
-    LayerMap.make(
-      (ref: Location.Ref) => {
-        const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
-        // Apply replacements during hoist, not afterward: replacements can
-        // introduce new tagged dependencies (Location.boundNode depends on
-        // Project), and the hoist walk is the only pass that can still slice
-        // those back out.
-        const location = LayerNode.hoist(locationServices, Node.tags.values.global, allReplacements)
+    Effect.gen(function* () {
+      const locations = yield* LayerMap.make(
+        (ref: Location.Ref) => {
+          const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
+          // Apply replacements during hoist, not afterward: replacements can
+          // introduce new tagged dependencies (Location.boundNode depends on
+          // Project), and the hoist walk is the only pass that can still slice
+          // those back out.
+          const location = LayerNode.hoist(locationServices, Node.tags.values.global, allReplacements)
 
-        return LayerNode.compile(location.node).pipe(
-          Layer.fresh,
-          Layer.tap(() =>
-            Effect.logInfo("booting location services", {
-              directory: ref.directory,
-              workspaceID: ref.workspaceID,
-            }),
-          ),
-          Layer.provide(LayerNode.compile(location.hoisted)),
-        )
-      },
-      { idleTimeToLive: "60 minutes" },
-    ),
+          return LayerNode.compile(location.node).pipe(
+            Layer.fresh,
+            Layer.tap(() =>
+              Effect.logInfo("booting location services", {
+                directory: ref.directory,
+                workspaceID: ref.workspaceID,
+              }),
+            ),
+            Layer.provide(LayerNode.compile(location.hoisted)),
+          )
+        },
+        { idleTimeToLive: "60 minutes" },
+      )
+      const refs = new Map<Location.Ref["directory"], Map<Location.Ref["workspaceID"], Location.Ref>>()
+      const normalize = (ref: Location.Ref) =>
+        Location.Ref.make({ directory: ref.directory, workspaceID: ref.workspaceID })
+      const remember = (ref: Location.Ref) => {
+        const normalized = normalize(ref)
+        const directory = refs.get(normalized.directory) ?? new Map()
+        refs.set(normalized.directory, directory)
+        directory.set(normalized.workspaceID, normalized)
+        return normalized
+      }
+      const forget = (ref: Location.Ref) => {
+        const directory = refs.get(ref.directory)
+        if (!directory) return
+        directory.delete(ref.workspaceID)
+        if (directory.size === 0) refs.delete(ref.directory)
+      }
+      return {
+        ...locations,
+        get: (ref: Location.Ref) => locations.get(remember(ref)),
+        contextEffect: (ref: Location.Ref) => locations.contextEffect(remember(ref)),
+        invalidate: (ref: Location.Ref) => {
+          const normalized = normalize(ref)
+          forget(normalized)
+          return locations.invalidate(normalized)
+        },
+        invalidateDirectory: (directory: Location.Ref["directory"]) => {
+          const found = refs.get(directory)
+          refs.delete(directory)
+          if (!found) return Effect.void
+          return Effect.forEach(found.values(), (ref) => locations.invalidate(ref), {
+            concurrency: "unbounded",
+            discard: true,
+          })
+        },
+      }
+    }),
   )
 }
 
