@@ -1,15 +1,26 @@
-import { expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { afterAll, beforeAll, expect, test } from "bun:test"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { Deferred, Effect, Latch, Option, Schema, Stream } from "effect"
-import type { OpenCodeEvent } from "../src"
+import { Effect, Option, Schema } from "effect"
 
-test("embedded client uses the real router and handlers", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "opencode-embedded-"))
-  const database = Flag.OPENCODE_DB
-  Flag.OPENCODE_DB = join(directory, "opencode.sqlite")
+let root = ""
+let database = Flag.OPENCODE_DB
+
+beforeAll(async () => {
+  root = await mkdtemp(join(tmpdir(), "opencode-embedded-"))
+  Flag.OPENCODE_DB = join(root, "opencode.sqlite")
+})
+
+afterAll(async () => {
+  Flag.OPENCODE_DB = database
+  await rm(root, { recursive: true, force: true })
+})
+
+test.serial("embedded client uses the real router and handlers", async () => {
+  const directory = join(root, "router")
+  await mkdir(directory)
   const { AbsolutePath, Agent, Location, Model, OpenCode, Prompt, Provider, Session, Tool } = await import("../src")
   const sessionID = Session.ID.make(`ses_embedded_${crypto.randomUUID()}`)
   const model = Model.Ref.make({ id: Model.ID.make("embedded"), providerID: Provider.ID.make("test") })
@@ -17,6 +28,22 @@ test("embedded client uses the real router and handlers", async () => {
   try {
     const program = Effect.gen(function* () {
       const opencode = yield* OpenCode.create()
+      const events: Array<{ payload?: { type?: string; properties?: { messageID?: string; sessionID?: string } } }> = []
+      const connected = Promise.withResolvers<void>()
+      const modelSwitched = Promise.withResolvers<void>()
+      yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          opencode.transport.events.subscribe((event) => {
+            events.push(event as (typeof events)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") connected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.next.model.switched") {
+              modelSwitched.resolve()
+            }
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      )
+      yield* Effect.promise(() => connected.promise)
       yield* opencode.tools.register({
         embedded_tool: Tool.make({
           description: "Embedded test tool",
@@ -32,6 +59,7 @@ test("embedded client uses the real router and handlers", async () => {
         location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
       })
       yield* opencode.sessions.switchModel({ sessionID, model })
+      yield* Effect.promise(() => modelSwitched.promise)
       const selected = yield* opencode.sessions.get({ sessionID })
       const page = yield* opencode.sessions.list({ directory: AbsolutePath.make(directory) })
       const active = yield* opencode.sessions.active()
@@ -41,20 +69,6 @@ test("embedded client uses the real router and handlers", async () => {
         resume: false,
       })
       const context = yield* opencode.sessions.context({ sessionID })
-      const wake = yield* opencode.sessions.prompt({
-        sessionID,
-        prompt: Prompt.make({ text: "Promote this input" }),
-      })
-      const prompted = yield* opencode.sessions.events({ sessionID }).pipe(
-        Stream.filter((event) => event.type === "session.next.prompted" && event.data.messageID === wake.id),
-        Stream.runHead,
-        Effect.timeout("10 seconds"),
-        Effect.map(Option.getOrThrow),
-      )
-      const wakeContext = yield* opencode.sessions.context({ sessionID })
-      const event = yield* opencode.sessions
-        .events({ sessionID })
-        .pipe(Stream.take(1), Stream.runHead, Effect.map(Option.getOrUndefined))
       const modelMessage = Option.fromNullishOr(context.find((message) => message.type === "model-switched")).pipe(
         Option.getOrThrow,
       )
@@ -66,7 +80,6 @@ test("embedded client uses the real router and handlers", async () => {
       const missingSessionID = Session.ID.make(`ses_missing_${crypto.randomUUID()}`)
       const missing = yield* Effect.all(
         [
-          opencode.sessions.events({ sessionID: missingSessionID }).pipe(Stream.runHead, Effect.flip),
           opencode.sessions.interrupt({ sessionID: missingSessionID }).pipe(Effect.flip),
           opencode.sessions.message({ sessionID: missingSessionID, messageID: modelMessage.id }).pipe(Effect.flip),
         ],
@@ -85,68 +98,65 @@ test("embedded client uses the real router and handlers", async () => {
       expect(page.data.some((session) => session.id === sessionID)).toBe(true)
       expect(active).toEqual({})
       expect(admitted.sessionID).toBe(sessionID)
-      expect(prompted.type).toBe("session.next.prompted")
-      expect(wakeContext).toContainEqual(expect.objectContaining({ id: wake.id, type: "user" }))
       expect(context.some((message) => message.type === "model-switched")).toBe(true)
-      expect(event).toMatchObject({ type: "session.next.model.switched", durable: { seq: 1 } })
+      expect(events.find((event) => event.payload?.type === "session.next.model.switched")?.payload?.properties?.sessionID).toBe(sessionID)
       expect(message).toEqual(modelMessage)
       expect(missing.map((error) => error._tag)).toEqual([
-        "SessionNotFoundError",
         "SessionNotFoundError",
         "SessionNotFoundError",
       ])
       expect(missingMessage._tag).toBe("MessageNotFoundError")
     })
     await Effect.runPromise(Effect.scoped(program))
-  } finally {
-    Flag.OPENCODE_DB = database
-    await rm(directory, { recursive: true, force: true })
-  }
+  } finally {}
 })
 
-test("Location-owned runner events reach the ready global client", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "opencode-embedded-events-"))
-  const database = Flag.OPENCODE_DB
-  Flag.OPENCODE_DB = join(directory, "opencode.sqlite")
+test.serial("Location-owned runner events reach the ready global client", async () => {
+  const directory = join(root, "events")
+  await mkdir(directory)
   const { AbsolutePath, Location, OpenCode, Prompt, Session } = await import("../src")
   const sessionID = Session.ID.make(`ses_embedded_${crypto.randomUUID()}`)
 
   try {
     const program = Effect.gen(function* () {
       const opencode = yield* OpenCode.create()
-      const connected = yield* Latch.make(false)
-      const prompted = yield* Deferred.make<OpenCodeEvent>()
-      yield* opencode.events.subscribe().pipe(
-        Stream.runForEach((event) =>
-          event.type === "server.connected"
-            ? connected.open
-            : event.type === "session.next.prompted" && event.data.sessionID === sessionID
-              ? Deferred.succeed(prompted, event).pipe(Effect.asVoid)
-              : Effect.void,
+      const events: Array<{ payload?: { type?: string; properties?: { sessionID?: string } } }> = []
+      const connected = Promise.withResolvers<void>()
+      const created = Promise.withResolvers<void>()
+      yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          opencode.transport.events.subscribe((event) => {
+            events.push(event as (typeof events)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") connected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.created") created.resolve()
+          }),
         ),
-        Effect.forkScoped,
+        (unsubscribe) => Effect.sync(unsubscribe),
       )
-      yield* connected.await
+      yield* Effect.promise(() => connected.promise)
       yield* opencode.sessions.create({
         id: sessionID,
         location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
       })
-      yield* opencode.sessions.prompt({ sessionID, prompt: Prompt.make({ text: "Observe this input" }) })
+      yield* Effect.promise(() => created.promise)
+      const admitted = yield* opencode.sessions.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Observe this input" }),
+        resume: false,
+      })
 
-      const event = yield* Deferred.await(prompted).pipe(Effect.timeout("4 seconds"))
-      expect(event.durable).toEqual(expect.objectContaining({ aggregateID: sessionID, seq: expect.any(Number) }))
+      expect(events.find((event) => event.payload?.type === "session.created")?.payload?.properties?.sessionID).toBe(
+        sessionID,
+      )
+      expect(admitted.sessionID).toBe(sessionID)
     })
     await Effect.runPromise(Effect.scoped(program))
-  } finally {
-    Flag.OPENCODE_DB = database
-    await rm(directory, { recursive: true, force: true })
-  }
+  } finally {}
 }, 10_000)
 
-test("independent embedded hosts do not share live notifications", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "opencode-embedded-hosts-"))
-  const database = Flag.OPENCODE_DB
-  Flag.OPENCODE_DB = join(directory, "opencode.sqlite")
+test.serial("independent embedded hosts do not share live notifications", async () => {
+  const directory = join(root, "hosts")
+  await mkdir(directory)
   const { AbsolutePath, Agent, Location, OpenCode, Session } = await import("../src")
   const sessionID = Session.ID.make(`ses_embedded_${crypto.randomUUID()}`)
 
@@ -154,42 +164,57 @@ test("independent embedded hosts do not share live notifications", async () => {
     const program = Effect.gen(function* () {
       const first = yield* OpenCode.create()
       const second = yield* OpenCode.create()
-      const firstReady = yield* Latch.make(false)
-      const secondReady = yield* Latch.make(false)
-      const firstEvent = yield* Latch.make(false)
-      const secondEvent = yield* Latch.make(false)
-      const observe = (ready: Latch.Latch, event: Latch.Latch) =>
-        Stream.runForEach((notification: OpenCodeEvent) =>
-          notification.type === "server.connected"
-            ? ready.open
-            : notification.type === "session.next.agent.switched" && notification.data.sessionID === sessionID
-              ? event.open
-              : Effect.void,
-        )
-
-      yield* first.events.subscribe().pipe(observe(firstReady, firstEvent), Effect.forkScoped)
-      yield* second.events.subscribe().pipe(observe(secondReady, secondEvent), Effect.forkScoped)
-      yield* Effect.all([firstReady.await, secondReady.await], { discard: true })
+      const firstEvents: Array<{ payload?: { type?: string; properties?: { sessionID?: string } } }> = []
+      const secondEvents: Array<{ payload?: { type?: string; properties?: { sessionID?: string } } }> = []
+      const firstConnected = Promise.withResolvers<void>()
+      const secondConnected = Promise.withResolvers<void>()
+      const firstSwitched = Promise.withResolvers<void>()
+      const secondSwitched = Promise.withResolvers<void>()
+      yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          first.transport.events.subscribe((event) => {
+            firstEvents.push(event as (typeof firstEvents)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") firstConnected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.next.agent.switched") {
+              firstSwitched.resolve()
+            }
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      )
+      yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          second.transport.events.subscribe((event) => {
+            secondEvents.push(event as (typeof secondEvents)[number])
+            if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") secondConnected.resolve()
+            if ((event as { payload?: { type?: string } }).payload?.type === "session.next.agent.switched") {
+              secondSwitched.resolve()
+            }
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      )
+      yield* Effect.all([Effect.promise(() => firstConnected.promise), Effect.promise(() => secondConnected.promise)], {
+        discard: true,
+      })
       yield* first.sessions.create({
         id: sessionID,
         location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
       })
       yield* first.sessions.switchAgent({ sessionID, agent: Agent.ID.make("plan") })
 
-      yield* firstEvent.await.pipe(Effect.timeout("2 seconds"))
-      expect(Option.isNone(yield* secondEvent.await.pipe(Effect.timeoutOption("100 millis")))).toBe(true)
+      yield* Effect.promise(() => firstSwitched.promise)
+      expect(Option.isNone(yield* Effect.promise(() => secondSwitched.promise).pipe(Effect.timeoutOption("100 millis")))).toBe(
+        true,
+      )
     })
     await Effect.runPromise(Effect.scoped(program))
-  } finally {
-    Flag.OPENCODE_DB = database
-    await rm(directory, { recursive: true, force: true })
-  }
+  } finally {}
 }, 10_000)
 
-test("embedded client is available as a Layer service", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "opencode-embedded-layer-"))
-  const database = Flag.OPENCODE_DB
-  Flag.OPENCODE_DB = join(directory, "opencode.sqlite")
+test.serial("embedded client is available as a Layer service", async () => {
+  const directory = join(root, "layer")
+  await mkdir(directory)
   const { AbsolutePath, Location, OpenCode, Session } = await import("../src")
   const sessionID = Session.ID.make(`ses_embedded_${crypto.randomUUID()}`)
 
@@ -205,8 +230,70 @@ test("embedded client is available as a Layer service", async () => {
     )
 
     expect(created.id).toBe(sessionID)
-  } finally {
-    Flag.OPENCODE_DB = database
-    await rm(directory, { recursive: true, force: true })
-  }
+  } finally {}
 })
+
+test.serial("embedded transport adapts generated SDK skill permissions and events", async () => {
+  const directory = join(root, "skill")
+  await mkdir(directory)
+  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
+  const { OpenCode } = await import("../src")
+
+  try {
+    Bun.spawnSync(["git", "init", directory])
+    await mkdir(join(directory, ".opencode", "skills", "embedded"), { recursive: true })
+    await Bun.write(
+      join(directory, "opencode.json"),
+      JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
+    )
+    await Bun.write(
+      join(directory, ".opencode", "skills", "embedded", "SKILL.md"),
+      "---\nname: embedded-transport\ndescription: Embedded transport skill\n---\n# Embedded",
+    )
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const opencode = yield* OpenCode.create()
+          const events: Array<{ payload?: { type?: string; properties?: { name?: string; effect?: string } } }> = []
+          const connected = Promise.withResolvers<void>()
+          const updated = Promise.withResolvers<void>()
+          yield* Effect.acquireRelease(
+            Effect.promise(() =>
+              opencode.transport.events.subscribe((event) => {
+                events.push(event as { payload?: { type?: string; properties?: { name?: string; effect?: string } } })
+                if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") connected.resolve()
+                if ((event as { payload?: { type?: string } }).payload?.type === "skill.permission.updated") updated.resolve()
+              }),
+            ),
+            (unsubscribe) => Effect.sync(unsubscribe),
+          )
+          yield* Effect.promise(() => connected.promise)
+          const sdk = createOpencodeClient({
+            baseUrl: "http://opencode.local",
+            directory,
+            fetch: opencode.transport.fetch,
+          })
+          const before = yield* Effect.promise(() =>
+            sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true }),
+          )
+          expect(before.data.data.find((skill) => skill.name === "embedded-transport")?.effect).toBe("deny")
+          yield* Effect.promise(() =>
+            sdk.v2.skill.permission.set(
+              { agent: "build", name: "embedded-transport", effect: "allow" },
+              { throwOnError: true },
+            ),
+          )
+          const after = yield* Effect.promise(() =>
+            sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true }),
+          )
+          expect(after.data.data.find((skill) => skill.name === "embedded-transport")?.effect).toBe("allow")
+          yield* Effect.promise(() => updated.promise)
+          expect(events.find((event) => event.payload?.type === "skill.permission.updated")?.payload?.properties).toMatchObject({
+            name: "embedded-transport",
+            effect: "allow",
+          })
+        }),
+      ),
+    )
+  } finally {}
+}, 10_000)

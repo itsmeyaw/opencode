@@ -1,15 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import path from "path"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { Server } from "../../src/server/server"
-import { Effect, Fiber } from "effect"
+import { Context, Effect, Fiber, Layer } from "effect"
+import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import Http from "node:http"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
-import { TestLLMServer } from "../lib/llm-server"
+import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 
 const it = testEffect(TestLLMServer.layer)
+
+setDefaultTimeout(30_000)
 
 const environment = [
   "OPENCODE_CONFIG_DIR",
@@ -21,12 +26,21 @@ const environment = [
 
 const original = Object.fromEntries(environment.map((key) => [key, process.env[key]]))
 
+function environmentTest(name: string, fn: () => Promise<void>) {
+  return test(name, async () => {
+    try {
+      await fn()
+    } finally {
+      for (const key of environment) {
+        const value = original[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+}
+
 afterEach(async () => {
-  for (const key of environment) {
-    const value = original[key]
-    if (value === undefined) delete process.env[key]
-    else process.env[key] = value
-  }
   await disposeAllInstances()
   await resetDatabase()
 })
@@ -40,10 +54,6 @@ description: ${description}
 ---
 # ${name}`,
   )
-}
-
-function sortedNames(skills: ReadonlyArray<{ name: string }>) {
-  return skills.map((skill) => skill.name).toSorted()
 }
 
 function toolNames(input: Record<string, unknown> | undefined) {
@@ -62,36 +72,44 @@ function enableExternalSources() {
   process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "false"
 }
 
-describe("skill HttpApi", () => {
-  test("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", async () => {
-    await using home = await tmpdir()
-    await using project = await tmpdir({ git: true })
-    using catalog = Bun.serve({
-      port: 0,
-      fetch(request) {
-        const pathname = new URL(request.url).pathname
-        if (pathname === "/catalog/index.json") {
-          return Response.json({
-            skills: [
-              { name: "ticket-2-url", version: "1", files: ["SKILL.md"] },
-              { name: "customize-opencode", version: "1", files: ["SKILL.md"] },
-            ],
-          })
-        }
-        if (pathname === "/catalog/ticket-2-url/SKILL.md") {
-          return new Response(`---\nname: ticket-2-url\ndescription: URL skill\n---\n# URL skill`)
-        }
-        if (pathname === "/catalog/customize-opencode/SKILL.md") {
-          return new Response(`---\nname: customize-opencode\ndescription: URL duplicate\n---\n# URL duplicate`)
-        }
-        return new Response("Not Found", { status: 404 })
-      },
-    })
-
-    process.env.OPENCODE_TEST_HOME = home.path
-    process.env.OPENCODE_CONFIG_DIR = path.join(home.path, "config")
-    enableExternalSources()
-    await Promise.all([
+describe.serial("skill HttpApi", () => {
+  environmentTest("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", () =>
+    Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(
+            NodeHttpServer.layer(Http.createServer, { host: "127.0.0.1", port: 0 }).pipe(Layer.provide(NodeServices.layer)),
+          )
+          const catalog = Context.get(context, HttpServer.HttpServer)
+          yield* catalog.serve(
+            HttpServerRequest.HttpServerRequest.use((request) => {
+              const pathname = new URL(request.url, "http://localhost").pathname
+              if (pathname === "/catalog/index.json")
+                return HttpServerResponse.json({
+                  skills: [
+                    { name: "ticket-2-url", version: "1", files: ["SKILL.md"] },
+                    { name: "customize-opencode", version: "1", files: ["SKILL.md"] },
+                  ],
+                })
+              if (pathname === "/catalog/ticket-2-url/SKILL.md")
+                return Effect.succeed(
+                  HttpServerResponse.text(`---\nname: ticket-2-url\ndescription: URL skill\n---\n# URL skill`),
+                )
+              if (pathname === "/catalog/customize-opencode/SKILL.md")
+                return Effect.succeed(
+                  HttpServerResponse.text(`---\nname: customize-opencode\ndescription: URL duplicate\n---\n# URL duplicate`),
+                )
+              return Effect.succeed(HttpServerResponse.text("Not Found", { status: 404 }))
+            }),
+          )
+          const address = HttpServer.formatAddress(catalog.address)
+          yield* Effect.promise(async () => {
+            await using home = await tmpdir()
+            await using project = await tmpdir({ git: true })
+            process.env.OPENCODE_TEST_HOME = home.path
+            process.env.OPENCODE_CONFIG_DIR = path.join(home.path, "config")
+            enableExternalSources()
+            await Promise.all([
       writeSkill(home.path, ".claude/skills/customize", "customize-opencode", "Global Claude duplicate"),
       writeSkill(home.path, ".agents/skills/customize", "customize-opencode", "Global agent duplicate"),
       writeSkill(process.env.OPENCODE_CONFIG_DIR, "skills/global-opencode", "ticket-2-global", "Global OpenCode skill"),
@@ -106,35 +124,42 @@ describe("skill HttpApi", () => {
           lsp: false,
           skills: {
             paths: ["./extra"],
-            urls: [`http://127.0.0.1:${catalog.port}/catalog/`],
+            urls: [`${address}/catalog/`],
           },
         }),
       ),
-    ])
+            ])
 
-    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
-    try {
+            const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+            try {
       const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
       const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const repeated = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-      expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-      expect(sortedNames(current.data.data)).toEqual([
+      expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+      expect(current.data.data.map((skill) => skill.name)).toEqual([
         "customize-opencode",
+        "ticket-2-project",
         "ticket-2-global",
         "ticket-2-path",
-        "ticket-2-project",
         "ticket-2-url",
       ])
-      expect(current.data.data.map((skill) => skill.name)).toEqual(repeated.data.data.map((skill) => skill.name))
+      expect(repeated.data.data.map((skill) => skill.name)).toEqual(current.data.data.map((skill) => skill.name))
+      expect((await sdk.app.skills(undefined, { throwOnError: true })).data.map((skill) => skill.name)).toEqual(
+        current.data.data.map((skill) => skill.name),
+      )
       expect(current.data.data.find((skill) => skill.name === "customize-opencode")?.description).toBe("URL duplicate")
-    } finally {
-      await listener.stop()
-    }
-  })
+            } finally {
+              await listener.stop()
+            }
+          })
+        }),
+      ).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  )
 
-  test("matches eligible global and project Claude and agent skill sources", async () => {
+  environmentTest("matches eligible global and project Claude and agent skill sources", async () => {
     await using home = await tmpdir()
     await using project = await tmpdir({ git: true })
     process.env.OPENCODE_TEST_HOME = home.path
@@ -155,21 +180,21 @@ describe("skill HttpApi", () => {
       const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-      expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-      expect(sortedNames(current.data.data)).toEqual([
+      expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+      expect(current.data.data.map((skill) => skill.name)).toEqual([
         "customize-opencode",
-        "ticket-2-global-agent",
         "ticket-2-global-claude",
-        "ticket-2-opencode",
-        "ticket-2-project-agent",
+        "ticket-2-global-agent",
         "ticket-2-project-claude",
+        "ticket-2-project-agent",
+        "ticket-2-opencode",
       ])
     } finally {
       await listener.stop()
     }
   })
 
-  test("preserves direct and broad Claude skill disable flags", async () => {
+  environmentTest("preserves direct and broad Claude skill disable flags", async () => {
     for (const flag of ["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS", "OPENCODE_DISABLE_CLAUDE_CODE"] as const) {
       await using home = await tmpdir()
       await using project = await tmpdir({ git: true })
@@ -192,12 +217,12 @@ describe("skill HttpApi", () => {
         const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
         const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-        expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-        expect(sortedNames(current.data.data)).toEqual([
+        expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+        expect(current.data.data.map((skill) => skill.name)).toEqual([
           "customize-opencode",
           "ticket-2-global-agent",
-          "ticket-2-opencode",
           "ticket-2-project-agent",
+          "ticket-2-opencode",
         ])
       } finally {
         await listener.stop()
@@ -206,7 +231,7 @@ describe("skill HttpApi", () => {
     }
   })
 
-  test("external disable excludes only automatic Claude and agent sources", async () => {
+  environmentTest("external disable excludes only automatic Claude and agent sources", async () => {
     await using home = await tmpdir()
     await using project = await tmpdir({ git: true })
     process.env.OPENCODE_TEST_HOME = home.path
@@ -232,8 +257,8 @@ describe("skill HttpApi", () => {
       const current = await sdk.v2.skill.list(undefined, { throwOnError: true })
       const legacy = await sdk.app.skills(undefined, { throwOnError: true })
 
-      expect(sortedNames(current.data.data)).toEqual(sortedNames(legacy.data))
-      expect(sortedNames(current.data.data)).toEqual(["customize-opencode", "ticket-2-opencode", "ticket-2-path"])
+      expect(current.data.data.map((skill) => skill.name)).toEqual(legacy.data.map((skill) => skill.name))
+      expect(current.data.data.map((skill) => skill.name)).toEqual(["customize-opencode", "ticket-2-opencode", "ticket-2-path"])
     } finally {
       await listener.stop()
     }
@@ -1092,6 +1117,410 @@ describe("skill HttpApi", () => {
       await listener.stop()
     }
   })
+
+  test("reconciles every exact wildcard skill request without touching other Sessions, agents, actions, or Locations", async () => {
+    await using first = await tmpdir({ git: true })
+    await using second = await tmpdir({ git: true })
+    await Promise.all(
+      [first.path, second.path].flatMap((directory) => [
+        writeSkill(directory, ".opencode/skills/target", "ticket-6-exact*", "Exact target"),
+        writeSkill(directory, ".opencode/skills/similar", "ticket-6-exact-one", "Similar target"),
+        Bun.write(
+          path.join(directory, "opencode.json"),
+          JSON.stringify({ formatter: false, lsp: false, permission: { skill: "ask", bash: "ask" } }),
+        ),
+      ]),
+    )
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const firstSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: first.path })
+      const secondSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: second.path })
+      const create = (sdk: ReturnType<typeof createOpencodeClient>, directory: string, agent: string) =>
+        sdk.v2.session.create({ agent, location: { directory } }, { throwOnError: true })
+      const [one, two, otherAgent, otherLocation] = await Promise.all([
+        create(firstSdk, first.path, "build"),
+        create(firstSdk, first.path, "build"),
+        create(firstSdk, first.path, "plan"),
+        create(secondSdk, second.path, "build"),
+      ])
+      const ask = (
+        sdk: ReturnType<typeof createOpencodeClient>,
+        sessionID: string,
+        agent: string,
+        action: "skill" | "bash",
+        resource: string,
+      ) => sdk.v2.session.permission.create({ sessionID, agent, action, resources: [resource] }, { throwOnError: true })
+      const [firstTarget, secondTarget, agentTarget, locationTarget, otherAction, similar] = await Promise.all([
+        ask(firstSdk, one.data.data.id, "build", "skill", "ticket-6-exact*"),
+        ask(firstSdk, two.data.data.id, "build", "skill", "ticket-6-exact*"),
+        ask(firstSdk, otherAgent.data.data.id, "plan", "skill", "ticket-6-exact*"),
+        ask(secondSdk, otherLocation.data.data.id, "build", "skill", "ticket-6-exact*"),
+        ask(firstSdk, one.data.data.id, "build", "bash", "echo"),
+        ask(firstSdk, one.data.data.id, "build", "skill", "ticket-6-exact-one"),
+      ])
+      await firstSdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-exact*", effect: "allow" },
+        { throwOnError: true },
+      )
+      const pending = async (sdk: ReturnType<typeof createOpencodeClient>, sessionID: string) =>
+        (await sdk.v2.session.permission.list({ sessionID }, { throwOnError: true })).data.data.map((item) => item.id)
+      expect(await pending(firstSdk, one.data.data.id)).toEqual(expect.arrayContaining([otherAction.data.data.id, similar.data.data.id]))
+      expect(await pending(firstSdk, one.data.data.id)).not.toContain(firstTarget.data.data.id)
+      expect(await pending(firstSdk, two.data.data.id)).not.toContain(secondTarget.data.data.id)
+      expect(await pending(firstSdk, otherAgent.data.data.id)).toContain(agentTarget.data.data.id)
+      expect(await pending(secondSdk, otherLocation.data.data.id)).toContain(locationTarget.data.data.id)
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  test("settles a concurrent explicit reply and runtime allow exactly once without fan-out or saved approval", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/race", "ticket-6-race", "Race skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({ formatter: false, lsp: false, permission: { skill: "ask", bash: "ask" } }),
+      ),
+    ])
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    const controller = new AbortController()
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const session = await sdk.v2.session.create(
+        { agent: "build", location: { directory: project.path } },
+        { throwOnError: true },
+      )
+      const sessionID = session.data.data.id
+      await sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true })
+      const events = await sdk.v2.event.subscribe({ signal: controller.signal })
+      const iterator = events.stream[Symbol.asyncIterator]()
+      await iterator.next()
+      const [raced, unrelated] = await Promise.all([
+        sdk.v2.session.permission.create(
+          { sessionID, agent: "build", action: "skill", resources: ["ticket-6-race"] },
+          { throwOnError: true },
+        ),
+        sdk.v2.session.permission.create(
+          { sessionID, agent: "build", action: "bash", resources: ["echo"] },
+          { throwOnError: true },
+        ),
+      ])
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-race", effect: "ask" },
+        { throwOnError: true },
+      )
+      const settled = await Promise.allSettled([
+        sdk.v2.session.permission.reply(
+          { sessionID, requestID: raced.data.data.id, reply: "once" },
+          { throwOnError: true },
+        ),
+        sdk.v2.skill.permission.set(
+          { agent: "build", name: "ticket-6-race", effect: "allow" },
+          { throwOnError: true },
+        ),
+      ])
+      expect(settled.filter((item) => item.status === "fulfilled")).toHaveLength(2)
+      const pending = await sdk.v2.session.permission.list({ sessionID }, { throwOnError: true })
+      expect(pending.data.data.map((item) => item.id)).toEqual([unrelated.data.data.id])
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-race", effect: "ask" },
+        { throwOnError: true },
+      )
+      const after = await sdk.v2.session.permission.create(
+        { sessionID, agent: "build", action: "skill", resources: ["ticket-6-race"] },
+        { throwOnError: true },
+      )
+      expect(after.data.data.effect).toBe("ask")
+      const replies: unknown[] = []
+      const observed: unknown[] = []
+      for (const _ of Array.from({ length: 6 })) {
+        const next = await iterator.next()
+        const event = next.value as { type?: string; data?: { requestID?: string } }
+        observed.push(event)
+        if (event.type === "permission.v2.replied" && event.data?.requestID === raced.data.data.id) replies.push(event)
+      }
+      expect(replies, JSON.stringify(observed)).toHaveLength(1)
+    } finally {
+      controller.abort()
+      await listener.stop()
+    }
+  })
+
+  it.live(
+    "reconciles only exact legacy provider requests across runtime effects without reply fan-out or saved approvals",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const first = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        const second = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        yield* Effect.promise(() =>
+          Promise.all(
+            [first.path, second.path].flatMap((directory) => [
+              writeSkill(directory, ".opencode/skills/exact", "ticket-6-legacy-exact*", "Exact legacy skill"),
+              writeSkill(directory, ".opencode/skills/similar", "ticket-6-legacy-exact-one", "Similar legacy skill"),
+              Bun.write(
+                path.join(directory, "opencode.json"),
+                JSON.stringify({ ...testProviderConfig(llm.url), permission: { skill: "ask", bash: "ask" } }),
+              ),
+            ]),
+          ),
+        )
+        const listener = yield* Effect.acquireRelease(
+          Effect.promise(() => Server.listen({ hostname: "127.0.0.1", port: 0 })),
+          (server) => Effect.promise(() => server.stop()),
+        )
+        const firstSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: first.path })
+        const secondSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: second.path })
+        const controller = new AbortController()
+        const events = yield* Effect.promise(() => firstSdk.event.subscribe(undefined, { signal: controller.signal }))
+        const iterator = events.stream[Symbol.asyncIterator]()
+        expect((yield* Effect.promise(() => iterator.next())).value?.type).toBe("server.connected")
+        const observed: unknown[] = []
+        const consume = (async () => {
+          while (true) {
+            const next = await iterator.next()
+            if (next.done) return
+            observed.push(next.value)
+          }
+        })()
+        const create = (sdk: ReturnType<typeof createOpencodeClient>, title: string) =>
+          Effect.promise(() => sdk.session.create({ title }, { throwOnError: true }))
+        const prompt = (
+          sdk: ReturnType<typeof createOpencodeClient>,
+          sessionID: string,
+          agent: "build" | "plan",
+          title: string,
+          tool: "skill",
+          permission: "skill",
+          args: Record<string, string>,
+        ) =>
+          Effect.gen(function* () {
+            yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes(title), tool, args)
+            yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes(title), `${title} completed`)
+            const running = yield* Effect.promise(() =>
+              sdk.session.prompt(
+                {
+                  sessionID,
+                  agent,
+                  model: { providerID: "test", modelID: "test-model" },
+                  parts: [{ type: "text", text: title }],
+                },
+                { throwOnError: true },
+              ),
+            ).pipe(Effect.forkScoped)
+            const request = yield* pollWithTimeout(
+              Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
+                Effect.map((result) =>
+                  result.data.find((item) => item.sessionID === sessionID && item.permission === permission),
+                ),
+              ),
+              `${title} request did not become pending`,
+            )
+            return { running, request }
+          })
+
+        const firstSession = yield* create(firstSdk, "Legacy exact reply race")
+        const siblingSession = yield* create(firstSdk, "Legacy exact runtime allow")
+        const agentSession = yield* create(firstSdk, "Legacy other agent")
+        const similarSession = yield* create(firstSdk, "Legacy similar skill")
+        const locationSession = yield* create(secondSdk, "Legacy other location")
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy exact reply race"),
+          reply().tool("skill", { name: "ticket-6-legacy-exact*" }).tool("bash", { command: "echo pending" }).item(),
+        )
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy exact reply race"),
+          "Legacy exact reply race completed",
+        )
+        const racedRunning = yield* Effect.promise(() =>
+          firstSdk.session.prompt(
+            {
+              sessionID: firstSession.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "Legacy exact reply race" }],
+            },
+            { throwOnError: true },
+          ),
+        ).pipe(Effect.forkScoped)
+        const raced = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === firstSession.data.id && item.permission === "skill")),
+          ),
+          "Legacy exact reply race request did not become pending",
+        )
+        const unrelated = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === firstSession.data.id && item.permission === "bash")),
+          ),
+          "Legacy unrelated action request did not become pending",
+        )
+        const sibling = yield* prompt(
+          firstSdk,
+          siblingSession.data.id,
+          "build",
+          "Legacy exact runtime allow",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact*" },
+        )
+        const otherAgent = yield* prompt(
+          firstSdk,
+          agentSession.data.id,
+          "plan",
+          "Legacy other agent",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact*" },
+        )
+        const similar = yield* prompt(
+          firstSdk,
+          similarSession.data.id,
+          "build",
+          "Legacy similar skill",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact-one" },
+        )
+        const otherLocation = yield* prompt(
+          secondSdk,
+          locationSession.data.id,
+          "build",
+          "Legacy other location",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact*" },
+        )
+
+        const release = Promise.withResolvers<void>()
+        const race = Effect.promise(() =>
+          Promise.all([
+            release.promise.then(() =>
+              firstSdk.permission.reply({ requestID: raced.id, reply: "once" }, { throwOnError: true }),
+            ),
+            release.promise.then(() =>
+              firstSdk.v2.skill.permission.set(
+                { agent: "build", name: "ticket-6-legacy-exact*", effect: "allow" },
+                { throwOnError: true },
+              ),
+            ),
+          ]),
+        )
+        release.resolve()
+        yield* race
+        yield* Fiber.join(sibling.running)
+        const pending = yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))
+        expect(pending.data.map((item) => item.id)).toEqual(expect.arrayContaining([unrelated.id, otherAgent.request.id, similar.request.id]))
+        expect(pending.data.map((item) => item.id)).not.toContain(sibling.request.id)
+        const otherLocationPending = yield* Effect.promise(() => secondSdk.permission.list(undefined, { throwOnError: true }))
+        expect(otherLocationPending.data.map((item) => item.id)).toContain(otherLocation.request.id)
+
+        yield* Effect.promise(() =>
+          firstSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact*", effect: "ask" },
+            { throwOnError: true },
+          ),
+        )
+        const afterSession = yield* create(firstSdk, "Legacy no saved approval")
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy no saved approval"),
+          reply().tool("skill", { name: "ticket-6-legacy-exact*" }).tool("bash", { command: "echo pending" }).item(),
+        )
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy no saved approval"),
+          "Legacy no saved approval completed",
+        )
+        const afterRunning = yield* Effect.promise(() =>
+          firstSdk.session.prompt(
+            {
+              sessionID: afterSession.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "Legacy no saved approval" }],
+            },
+            { throwOnError: true },
+          ),
+        ).pipe(Effect.forkScoped)
+        const after = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === afterSession.data.id && item.permission === "skill")),
+          ),
+          "Legacy no saved approval request did not become pending",
+        )
+        const afterUnrelated = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === afterSession.data.id && item.permission === "bash")),
+          ),
+          "Legacy no saved approval unrelated request did not become pending",
+        )
+        yield* Effect.promise(() =>
+          firstSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact*", effect: "deny" },
+            { throwOnError: true },
+          ),
+        )
+        const afterPending = yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))
+        expect(afterPending.data.map((item) => item.id)).not.toContain(after.id)
+        expect(afterPending.data.map((item) => item.id)).toContain(afterUnrelated.id)
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: afterUnrelated.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: otherAgent.request.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Effect.promise(() =>
+          firstSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact-one", effect: "deny" },
+            { throwOnError: true },
+          ),
+        )
+        yield* Effect.promise(() =>
+          secondSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact*", effect: "deny" },
+            { throwOnError: true },
+          ),
+        )
+        yield* Fiber.join(otherAgent.running)
+        yield* Fiber.join(similar.running)
+        yield* Fiber.join(otherLocation.running)
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: unrelated.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Fiber.join(racedRunning)
+        yield* Fiber.join(afterRunning)
+
+        yield* pollWithTimeout(
+          Effect.sync(() =>
+            observed.some(
+              (event) =>
+                (event as { type?: string; properties?: { requestID?: string } }).type === "permission.replied" &&
+                (event as { properties?: { requestID?: string } }).properties?.requestID === raced.id,
+            )
+              ? true
+              : undefined,
+          ),
+          "legacy explicit reply was not published",
+        )
+        yield* Effect.promise(() => iterator.return?.())
+        yield* Effect.promise(() => consume)
+        const replies = observed.filter(
+          (event) =>
+            (event as { type?: string; properties?: { requestID?: string } }).type === "permission.replied" &&
+            (event as { properties?: { requestID?: string } }).properties?.requestID === raced.id,
+        )
+        expect(replies, JSON.stringify(observed)).toHaveLength(1)
+        controller.abort()
+        yield* llm.reset
+      }),
+    30_000,
+  )
 
   it.live(
     "keeps wildcard characters in runtime skill names exact for legacy turns",

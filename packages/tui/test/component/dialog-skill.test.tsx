@@ -4,6 +4,9 @@ import { testRender, useRenderer } from "@opentui/solid"
 import { expect, test } from "bun:test"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+import { Effect, Exit, Scope } from "effect"
 import { createSignal, onCleanup, onMount } from "solid-js"
 import { DialogSkill } from "../../src/component/dialog-skill"
 import { TuiConfigProvider } from "../../src/config"
@@ -18,7 +21,7 @@ import { Toast, ToastProvider } from "../../src/ui/toast"
 import { tmpdir } from "../fixture/fixture"
 import { TestTuiContexts } from "../fixture/tui-environment"
 import { createTuiResolvedConfig } from "../fixture/tui-runtime"
-import { directory, eventSource, json } from "../fixture/tui-sdk"
+import { createEventSource, directory, eventSource, json } from "../fixture/tui-sdk"
 
 const location = { directory, project: { id: "proj_test", directory } }
 
@@ -36,6 +39,7 @@ async function mountDialog(input: {
   agent?: string
   sessionID?: string
   location?: { directory: string; workspaceID?: string }
+  events?: ReturnType<typeof createEventSource>["source"]
   keybinds?: Partial<TuiKeybind.Keybinds>
   onSelect?: (skill: string) => void
 }) {
@@ -68,7 +72,12 @@ async function mountDialog(input: {
 
     return (
       <TestTuiContexts paths={{ home: input.root, state, worktree: input.root }}>
-        <SDKProvider url="http://test" directory={directory} events={eventSource()} fetch={input.fetch}>
+        <SDKProvider
+          url="http://test"
+          directory={input.location?.directory ?? directory}
+          events={input.events ?? eventSource()}
+          fetch={input.fetch}
+        >
           <OpencodeKeymapProvider keymap={keymap}>
             <TuiConfigProvider config={config}>
               <KVProvider>
@@ -250,6 +259,140 @@ test("cycles the selected permission with Space and refreshes authoritative stat
         .split("\n")
         .find((line) => line.includes("deploy")),
     ).toContain("Ask")
+  } finally {
+    await dialog.cleanup()
+  }
+})
+
+test("refreshes an open dialog from matching external skill permission events", async () => {
+  await using tmp = await tmpdir()
+  const events = createEventSource()
+  const requestLocation = { directory: "/tmp/moved", workspaceID: "wrk_test" }
+  let effect = "ask"
+  let reads = 0
+  const fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
+    reads++
+    return json({
+      location,
+      data: [
+        {
+          name: "review",
+          description: "Review changes",
+          location: "/skills/review/SKILL.md",
+          content: "# Review",
+          effect,
+        },
+      ],
+    })
+  }) as typeof globalThis.fetch
+  const dialog = await mountDialog({ root: tmp.path, fetch, location: requestLocation, events: events.source })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"))
+    events.emit({
+      directory: "/tmp/unrelated",
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_unrelated",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    await Bun.sleep(20)
+    expect(reads).toBe(1)
+
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: "wrk_other",
+      payload: {
+        id: "evt_other_workspace",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_other_agent",
+        type: "skill.permission.updated",
+        properties: { agent: "plan", name: "review", effect: "deny" },
+      },
+    })
+    await Bun.sleep(20)
+    expect(reads).toBe(1)
+
+    effect = "deny"
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_matching",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    await wait(() => reads === 2 && dialog.app.captureCharFrame().includes("Denied"), "external refresh")
+    expect(dialog.app.captureCharFrame()).toContain("Skills")
+  } finally {
+    await dialog.cleanup()
+  }
+})
+
+test("defers an external refresh until a local mutation cannot be overwritten by its older read", async () => {
+  await using tmp = await tmpdir()
+  const events = createEventSource()
+  const requestLocation = { directory: "/tmp/moved", workspaceID: "wrk_test" }
+  let reads = 0
+  let finishOlderRead!: (response: Response) => void
+  const olderRead = new Promise<Response>((resolve) => {
+    finishOlderRead = resolve
+  })
+  const response = (effect: string) =>
+    json({
+      location,
+      data: [
+        {
+          name: "review",
+          description: "Review changes",
+          location: "/skills/review/SKILL.md",
+          content: "# Review",
+          effect,
+        },
+      ],
+    })
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
+    if (request.method === "PUT") return json({ location, data: { name: "review", effect: "allow" } })
+    reads++
+    if (reads === 1) return response("ask")
+    if (reads === 2) return olderRead
+    return response("deny")
+  }) as typeof globalThis.fetch
+  const dialog = await mountDialog({ root: tmp.path, fetch, location: requestLocation, events: events.source, sessionID: "ses_one" })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"))
+    dialog.app.mockInput.pressKey(" ")
+    await wait(() => reads === 2 && dialog.app.captureCharFrame().includes("Loading"), "local refresh")
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_external",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    expect(reads).toBe(2)
+    finishOlderRead(response("allow"))
+    await wait(() => reads === 3 && dialog.app.captureCharFrame().includes("Denied"), "deferred external refresh")
+    expect(dialog.app.captureCharFrame()).not.toContain("Loading")
+    expect(dialog.app.captureCharFrame()).toContain("Skills")
   } finally {
     await dialog.cleanup()
   }
@@ -586,5 +729,120 @@ test("Enter directly selects a denied skill and closes the dialog", async () => 
     expect(dialog.app.captureCharFrame()).not.toContain("Skills")
   } finally {
     await dialog.cleanup()
+  }
+})
+
+test.serial("uses an embedded host for authoritative reads, mutations, and external permission refreshes", async () => {
+  await using tmp = await tmpdir()
+  const database = Flag.OPENCODE_DB
+  const config = process.env.OPENCODE_CONFIG_DIR
+  const externalSkills = process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS
+  const claudeSkills = process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
+  const scope = Effect.runSync(Scope.make())
+  Flag.OPENCODE_DB = path.join(tmp.path, "opencode.sqlite")
+  process.env.OPENCODE_CONFIG_DIR = path.join(tmp.path, "config")
+  process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "true"
+  process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = "true"
+  let cleanup: (() => Promise<void>) | undefined
+
+  try {
+    const { AbsolutePath, Agent, OpenCode } = await import("@opencode-ai/sdk-next")
+    const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
+    Bun.spawnSync(["git", "init", tmp.path])
+    await Bun.write(
+      path.join(tmp.path, "opencode.json"),
+      JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
+    )
+    await mkdir(path.join(tmp.path, ".opencode", "skills", "agent-eval"), { recursive: true })
+    await Bun.write(
+      path.join(tmp.path, ".opencode", "skills", "agent-eval", "SKILL.md"),
+      "---\nname: agent-eval\ndescription: Embedded agent evaluation skill\n---\n# Agent evaluation",
+    )
+    const opencode = await Effect.runPromise(OpenCode.create().pipe(Effect.provideService(Scope.Scope, scope)))
+    const location = { directory: tmp.path }
+    const session = await Effect.runPromise(
+      opencode.sessions.create({ location: { directory: AbsolutePath.make(tmp.path) }, agent: Agent.ID.make("build") }),
+    )
+    const external = createOpencodeClient({
+      baseUrl: "http://opencode.local",
+      directory: tmp.path,
+      fetch: opencode.transport.fetch,
+    })
+    const requests: Array<{
+      url: URL
+      method: string
+      body?: { agent: string; name: string; effect: string }
+      settled: boolean
+    }> = []
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      const entry = {
+        url: new URL(request.url),
+        method: request.method,
+        body:
+          request.method === "PUT"
+            ? ((await request.clone().json()) as { agent: string; name: string; effect: string })
+            : undefined,
+        settled: false,
+      }
+      requests.push(entry)
+      const response = await opencode.transport.fetch(request)
+      entry.settled = true
+      return response
+    }) as typeof globalThis.fetch
+    const selected: string[] = []
+    const dialog = await mountDialog({
+      root: tmp.path,
+      fetch,
+      events: {
+        subscribe: (handler) => opencode.transport.events.subscribe((event) => handler(event as GlobalEvent)),
+      },
+      location,
+      sessionID: session.id,
+      onSelect: (skill) => selected.push(skill),
+    })
+    cleanup = dialog.cleanup
+
+    await wait(
+      () => requests.some((request) => request.method === "GET" && request.settled),
+      "embedded authoritative read",
+    )
+    "agent-eval".split("").forEach((key) => dialog.app.mockInput.pressKey(key))
+    await wait(() => dialog.app.captureCharFrame().includes("agent-eval"), "embedded fixture skill")
+    const read = requests.find((request) => request.method === "GET")
+    expect(read?.url.pathname).toBe("/api/skill/permission")
+    expect(read?.url.searchParams.get("agent")).toBe("build")
+    expect(read?.url.searchParams.get("sessionID")).toBe(session.id)
+    expect(read?.url.searchParams.get("location[directory]")).toBe(tmp.path)
+    expect(read?.url.searchParams.has("location[workspace]")).toBe(false)
+
+    dialog.app.mockInput.pressArrow("down")
+    dialog.app.mockInput.pressKey(" ")
+    await wait(() => requests.some((request) => request.method === "PUT"), "embedded physical mutation")
+    const mutation = requests.find((request) => request.method === "PUT")
+    expect(mutation?.url.pathname).toBe("/api/skill/permission")
+    expect(mutation?.url.searchParams.get("location[directory]")).toBe(tmp.path)
+    expect(mutation?.url.searchParams.has("sessionID")).toBe(false)
+    expect(mutation?.url.searchParams.get("location[workspace]")).toBeNull()
+    expect(mutation?.body).toEqual({ agent: "build", name: "agent-eval", effect: "ask" })
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"), "embedded mutation refresh")
+    await external.v2.skill.permission.set(
+      { agent: "build", name: "agent-eval", effect: "allow" },
+      { throwOnError: true },
+    )
+    await wait(() => dialog.app.captureCharFrame().includes("Allowed"), "embedded external refresh")
+    dialog.app.mockInput.pressEnter()
+    await wait(() => selected.length === 1, "embedded selection")
+    expect(selected).toEqual(["agent-eval"])
+  } finally {
+    await cleanup?.()
+    await Effect.runPromise(Scope.close(scope, Exit.void))
+    Flag.OPENCODE_DB = database
+    if (config === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = config
+    if (externalSkills === undefined) delete process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS
+    else process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS = externalSkills
+    if (claudeSkills === undefined) delete process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
+    else process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = claudeSkills
   }
 })

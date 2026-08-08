@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { createEmbeddedRoutes } from "@opencode-ai/server/routes"
-import { Context, Effect, Layer, Scope } from "effect"
+import { Context, Effect, Fiber, Layer, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http"
 
 export const create = Effect.fn("OpenCode.create")(function* () {
@@ -36,9 +36,37 @@ export const create = Effect.fn("OpenCode.create")(function* () {
     Effect.provide(FetchHttpClient.layer),
     Effect.provideService(FetchHttpClient.Fetch, fetch),
   )
+  const transport = {
+    fetch,
+    events: {
+      subscribe: async (handler: (event: unknown) => void) => {
+        const fiber = Effect.runFork(
+          Effect.scoped(
+            client.events.subscribe().pipe(
+              Stream.runForEach((event) =>
+                Effect.sync(() => {
+                  handler({
+                    directory: event.location?.directory,
+                    workspace: event.location?.workspaceID,
+                    payload: { id: event.id, type: event.type, properties: event.data },
+                  })
+                }),
+              ),
+              Effect.provide(FetchHttpClient.layer),
+              Effect.provideService(FetchHttpClient.Fetch, fetch),
+            ),
+          ),
+        )
+        return () => {
+          void Effect.runPromise(Fiber.interrupt(fiber))
+        }
+      },
+    },
+  }
   return {
     ...client,
     tools: { register: tools.register },
+    transport,
   }
 })
 

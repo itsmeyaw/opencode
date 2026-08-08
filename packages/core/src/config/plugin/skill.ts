@@ -46,7 +46,7 @@ export const Plugin = define({
             )
           }
         }
-        const entries = yield* config.entries()
+        const entries = (yield* config.entries()).toReversed()
         const directories = entries.flatMap((entry) => (entry.type === "directory" ? [entry.path] : []))
         const items = entries.flatMap((entry) => (entry.type === "document" ? (entry.info.skills ?? []) : []))
         for (const directory of directories) {
