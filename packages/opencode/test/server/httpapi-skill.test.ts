@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import path from "path"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
@@ -9,10 +9,12 @@ import Http from "node:http"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
-import { TestLLMServer } from "../lib/llm-server"
+import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 
 const it = testEffect(TestLLMServer.layer)
+
+setDefaultTimeout(30_000)
 
 const environment = [
   "OPENCODE_CONFIG_DIR",
@@ -23,14 +25,9 @@ const environment = [
 ] as const
 
 const original = Object.fromEntries(environment.map((key) => [key, process.env[key]]))
-let environmentTail = Promise.resolve()
 
 function environmentTest(name: string, fn: () => Promise<void>) {
   return test(name, async () => {
-    const previous = environmentTail
-    const release = Promise.withResolvers<void>()
-    environmentTail = previous.then(() => release.promise)
-    await previous
     try {
       await fn()
     } finally {
@@ -39,7 +36,6 @@ function environmentTest(name: string, fn: () => Promise<void>) {
         if (value === undefined) delete process.env[key]
         else process.env[key] = value
       }
-      release.resolve()
     }
   })
 }
@@ -76,7 +72,7 @@ function enableExternalSources() {
   process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "false"
 }
 
-describe("skill HttpApi", () => {
+describe.serial("skill HttpApi", () => {
   environmentTest("matches the user-visible inventory for OpenCode, path, URL, built-in, and duplicate sources", () =>
     Effect.runPromise(
       Effect.scoped(
@@ -1250,6 +1246,281 @@ describe("skill HttpApi", () => {
       await listener.stop()
     }
   })
+
+  it.live(
+    "reconciles only exact legacy provider requests across runtime effects without reply fan-out or saved approvals",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const first = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        const second = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        yield* Effect.promise(() =>
+          Promise.all(
+            [first.path, second.path].flatMap((directory) => [
+              writeSkill(directory, ".opencode/skills/exact", "ticket-6-legacy-exact*", "Exact legacy skill"),
+              writeSkill(directory, ".opencode/skills/similar", "ticket-6-legacy-exact-one", "Similar legacy skill"),
+              Bun.write(
+                path.join(directory, "opencode.json"),
+                JSON.stringify({ ...testProviderConfig(llm.url), permission: { skill: "ask", bash: "ask" } }),
+              ),
+            ]),
+          ),
+        )
+        const listener = yield* Effect.acquireRelease(
+          Effect.promise(() => Server.listen({ hostname: "127.0.0.1", port: 0 })),
+          (server) => Effect.promise(() => server.stop()),
+        )
+        const firstSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: first.path })
+        const secondSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: second.path })
+        const controller = new AbortController()
+        const events = yield* Effect.promise(() => firstSdk.event.subscribe(undefined, { signal: controller.signal }))
+        const iterator = events.stream[Symbol.asyncIterator]()
+        expect((yield* Effect.promise(() => iterator.next())).value?.type).toBe("server.connected")
+        const observed: unknown[] = []
+        const consume = (async () => {
+          while (true) {
+            const next = await iterator.next()
+            if (next.done) return
+            observed.push(next.value)
+          }
+        })()
+        const create = (sdk: ReturnType<typeof createOpencodeClient>, title: string) =>
+          Effect.promise(() => sdk.session.create({ title }, { throwOnError: true }))
+        const prompt = (
+          sdk: ReturnType<typeof createOpencodeClient>,
+          sessionID: string,
+          agent: "build" | "plan",
+          title: string,
+          tool: "skill",
+          permission: "skill",
+          args: Record<string, string>,
+        ) =>
+          Effect.gen(function* () {
+            yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes(title), tool, args)
+            yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes(title), `${title} completed`)
+            const running = yield* Effect.promise(() =>
+              sdk.session.prompt(
+                {
+                  sessionID,
+                  agent,
+                  model: { providerID: "test", modelID: "test-model" },
+                  parts: [{ type: "text", text: title }],
+                },
+                { throwOnError: true },
+              ),
+            ).pipe(Effect.forkScoped)
+            const request = yield* pollWithTimeout(
+              Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
+                Effect.map((result) =>
+                  result.data.find((item) => item.sessionID === sessionID && item.permission === permission),
+                ),
+              ),
+              `${title} request did not become pending`,
+            )
+            return { running, request }
+          })
+
+        const firstSession = yield* create(firstSdk, "Legacy exact reply race")
+        const siblingSession = yield* create(firstSdk, "Legacy exact runtime allow")
+        const agentSession = yield* create(firstSdk, "Legacy other agent")
+        const similarSession = yield* create(firstSdk, "Legacy similar skill")
+        const locationSession = yield* create(secondSdk, "Legacy other location")
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy exact reply race"),
+          reply().tool("skill", { name: "ticket-6-legacy-exact*" }).tool("bash", { command: "echo pending" }).item(),
+        )
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy exact reply race"),
+          "Legacy exact reply race completed",
+        )
+        const racedRunning = yield* Effect.promise(() =>
+          firstSdk.session.prompt(
+            {
+              sessionID: firstSession.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "Legacy exact reply race" }],
+            },
+            { throwOnError: true },
+          ),
+        ).pipe(Effect.forkScoped)
+        const raced = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === firstSession.data.id && item.permission === "skill")),
+          ),
+          "Legacy exact reply race request did not become pending",
+        )
+        const unrelated = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === firstSession.data.id && item.permission === "bash")),
+          ),
+          "Legacy unrelated action request did not become pending",
+        )
+        const sibling = yield* prompt(
+          firstSdk,
+          siblingSession.data.id,
+          "build",
+          "Legacy exact runtime allow",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact*" },
+        )
+        const otherAgent = yield* prompt(
+          firstSdk,
+          agentSession.data.id,
+          "plan",
+          "Legacy other agent",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact*" },
+        )
+        const similar = yield* prompt(
+          firstSdk,
+          similarSession.data.id,
+          "build",
+          "Legacy similar skill",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact-one" },
+        )
+        const otherLocation = yield* prompt(
+          secondSdk,
+          locationSession.data.id,
+          "build",
+          "Legacy other location",
+          "skill",
+          "skill",
+          { name: "ticket-6-legacy-exact*" },
+        )
+
+        const release = Promise.withResolvers<void>()
+        const race = Effect.promise(() =>
+          Promise.all([
+            release.promise.then(() =>
+              firstSdk.permission.reply({ requestID: raced.id, reply: "once" }, { throwOnError: true }),
+            ),
+            release.promise.then(() =>
+              firstSdk.v2.skill.permission.set(
+                { agent: "build", name: "ticket-6-legacy-exact*", effect: "allow" },
+                { throwOnError: true },
+              ),
+            ),
+          ]),
+        )
+        release.resolve()
+        yield* race
+        yield* Fiber.join(sibling.running)
+        const pending = yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))
+        expect(pending.data.map((item) => item.id)).toEqual(expect.arrayContaining([unrelated.id, otherAgent.request.id, similar.request.id]))
+        expect(pending.data.map((item) => item.id)).not.toContain(sibling.request.id)
+        const otherLocationPending = yield* Effect.promise(() => secondSdk.permission.list(undefined, { throwOnError: true }))
+        expect(otherLocationPending.data.map((item) => item.id)).toContain(otherLocation.request.id)
+
+        yield* Effect.promise(() =>
+          firstSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact*", effect: "ask" },
+            { throwOnError: true },
+          ),
+        )
+        const afterSession = yield* create(firstSdk, "Legacy no saved approval")
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy no saved approval"),
+          reply().tool("skill", { name: "ticket-6-legacy-exact*" }).tool("bash", { command: "echo pending" }).item(),
+        )
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Legacy no saved approval"),
+          "Legacy no saved approval completed",
+        )
+        const afterRunning = yield* Effect.promise(() =>
+          firstSdk.session.prompt(
+            {
+              sessionID: afterSession.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "Legacy no saved approval" }],
+            },
+            { throwOnError: true },
+          ),
+        ).pipe(Effect.forkScoped)
+        const after = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === afterSession.data.id && item.permission === "skill")),
+          ),
+          "Legacy no saved approval request did not become pending",
+        )
+        const afterUnrelated = yield* pollWithTimeout(
+          Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === afterSession.data.id && item.permission === "bash")),
+          ),
+          "Legacy no saved approval unrelated request did not become pending",
+        )
+        yield* Effect.promise(() =>
+          firstSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact*", effect: "deny" },
+            { throwOnError: true },
+          ),
+        )
+        const afterPending = yield* Effect.promise(() => firstSdk.permission.list(undefined, { throwOnError: true }))
+        expect(afterPending.data.map((item) => item.id)).not.toContain(after.id)
+        expect(afterPending.data.map((item) => item.id)).toContain(afterUnrelated.id)
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: afterUnrelated.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: otherAgent.request.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Effect.promise(() =>
+          firstSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact-one", effect: "deny" },
+            { throwOnError: true },
+          ),
+        )
+        yield* Effect.promise(() =>
+          secondSdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy-exact*", effect: "deny" },
+            { throwOnError: true },
+          ),
+        )
+        yield* Fiber.join(otherAgent.running)
+        yield* Fiber.join(similar.running)
+        yield* Fiber.join(otherLocation.running)
+        yield* Effect.promise(() =>
+          firstSdk.permission.reply({ requestID: unrelated.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Fiber.join(racedRunning)
+        yield* Fiber.join(afterRunning)
+
+        yield* pollWithTimeout(
+          Effect.sync(() =>
+            observed.some(
+              (event) =>
+                (event as { type?: string; properties?: { requestID?: string } }).type === "permission.replied" &&
+                (event as { properties?: { requestID?: string } }).properties?.requestID === raced.id,
+            )
+              ? true
+              : undefined,
+          ),
+          "legacy explicit reply was not published",
+        )
+        yield* Effect.promise(() => iterator.return?.())
+        yield* Effect.promise(() => consume)
+        const replies = observed.filter(
+          (event) =>
+            (event as { type?: string; properties?: { requestID?: string } }).type === "permission.replied" &&
+            (event as { properties?: { requestID?: string } }).properties?.requestID === raced.id,
+        )
+        expect(replies, JSON.stringify(observed)).toHaveLength(1)
+        controller.abort()
+        yield* llm.reset
+      }),
+    30_000,
+  )
 
   it.live(
     "keeps wildcard characters in runtime skill names exact for legacy turns",
