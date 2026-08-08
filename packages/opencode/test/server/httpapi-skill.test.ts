@@ -1122,6 +1122,62 @@ describe("skill HttpApi", () => {
     }
   })
 
+  test("reconciles every exact wildcard skill request without touching other Sessions, agents, actions, or Locations", async () => {
+    await using first = await tmpdir({ git: true })
+    await using second = await tmpdir({ git: true })
+    await Promise.all(
+      [first.path, second.path].flatMap((directory) => [
+        writeSkill(directory, ".opencode/skills/target", "ticket-6-exact*", "Exact target"),
+        writeSkill(directory, ".opencode/skills/similar", "ticket-6-exact-one", "Similar target"),
+        Bun.write(
+          path.join(directory, "opencode.json"),
+          JSON.stringify({ formatter: false, lsp: false, permission: { skill: "ask", bash: "ask" } }),
+        ),
+      ]),
+    )
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const firstSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: first.path })
+      const secondSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: second.path })
+      const create = (sdk: ReturnType<typeof createOpencodeClient>, directory: string, agent: string) =>
+        sdk.v2.session.create({ agent, location: { directory } }, { throwOnError: true })
+      const [one, two, otherAgent, otherLocation] = await Promise.all([
+        create(firstSdk, first.path, "build"),
+        create(firstSdk, first.path, "build"),
+        create(firstSdk, first.path, "plan"),
+        create(secondSdk, second.path, "build"),
+      ])
+      const ask = (
+        sdk: ReturnType<typeof createOpencodeClient>,
+        sessionID: string,
+        agent: string,
+        action: "skill" | "bash",
+        resource: string,
+      ) => sdk.v2.session.permission.create({ sessionID, agent, action, resources: [resource] }, { throwOnError: true })
+      const [firstTarget, secondTarget, agentTarget, locationTarget, otherAction, similar] = await Promise.all([
+        ask(firstSdk, one.data.data.id, "build", "skill", "ticket-6-exact*"),
+        ask(firstSdk, two.data.data.id, "build", "skill", "ticket-6-exact*"),
+        ask(firstSdk, otherAgent.data.data.id, "plan", "skill", "ticket-6-exact*"),
+        ask(secondSdk, otherLocation.data.data.id, "build", "skill", "ticket-6-exact*"),
+        ask(firstSdk, one.data.data.id, "build", "bash", "echo"),
+        ask(firstSdk, one.data.data.id, "build", "skill", "ticket-6-exact-one"),
+      ])
+      await firstSdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-exact*", effect: "allow" },
+        { throwOnError: true },
+      )
+      const pending = async (sdk: ReturnType<typeof createOpencodeClient>, sessionID: string) =>
+        (await sdk.v2.session.permission.list({ sessionID }, { throwOnError: true })).data.data.map((item) => item.id)
+      expect(await pending(firstSdk, one.data.data.id)).toEqual(expect.arrayContaining([otherAction.data.data.id, similar.data.data.id]))
+      expect(await pending(firstSdk, one.data.data.id)).not.toContain(firstTarget.data.data.id)
+      expect(await pending(firstSdk, two.data.data.id)).not.toContain(secondTarget.data.data.id)
+      expect(await pending(firstSdk, otherAgent.data.data.id)).toContain(agentTarget.data.data.id)
+      expect(await pending(secondSdk, otherLocation.data.data.id)).toContain(locationTarget.data.data.id)
+    } finally {
+      await listener.stop()
+    }
+  })
+
   it.live(
     "keeps wildcard characters in runtime skill names exact for legacy turns",
     () =>
