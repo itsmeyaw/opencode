@@ -1,7 +1,7 @@
 export * as PermissionV2 from "./permission"
 
 import { makeLocationNode } from "./effect/app-node"
-import { Context, Deferred, Effect as EffectRuntime, Layer, Schema } from "effect"
+import { Context, Deferred, Effect as EffectRuntime, Layer, Schema, Stream } from "effect"
 import { Permission } from "@opencode-ai/schema/permission"
 import { EventV2 } from "./event"
 import { Location } from "./location"
@@ -11,6 +11,7 @@ import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
 import { PermissionSaved } from "./permission/saved"
 import { SkillPermission } from "./permission/skill"
+import { Skill } from "@opencode-ai/schema/skill"
 import { evaluate, merge, missingAgentPermissions } from "./permission/evaluate"
 
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
@@ -102,6 +103,43 @@ const layer = Layer.effect(
     const saved = yield* PermissionSaved.Service
     const skillPermission = yield* SkillPermission.Service
     const pending = new Map<ID, Pending>()
+
+    yield* events.subscribe(Skill.Event.PermissionUpdated).pipe(
+      Stream.runForEach((event) =>
+        EffectRuntime.uninterruptible(
+          EffectRuntime.gen(function* () {
+            if (
+              event.data.effect === "ask" ||
+              event.location?.directory !== location.directory ||
+              event.location?.workspaceID !== location.workspaceID
+            )
+              return
+            for (const [id, item] of pending) {
+              if (
+                item.request.action !== "skill" ||
+                item.agent !== event.data.agent ||
+                item.request.resources.length === 0 ||
+                !item.request.resources.every((resource) => resource === event.data.name)
+              )
+                continue
+              pending.delete(id)
+              const reply = event.data.effect === "allow" ? "once" : "reject"
+              yield* events.publish(Event.Replied, {
+                sessionID: item.request.sessionID,
+                requestID: item.request.id,
+                reply,
+              })
+              if (reply === "once") {
+                yield* Deferred.succeed(item.deferred, undefined)
+                continue
+              }
+              yield* Deferred.fail(item.deferred, new DeclinedError())
+            }
+          }),
+        ),
+      ),
+      EffectRuntime.forkScoped({ startImmediately: true }),
+    )
 
     yield* EffectRuntime.addFinalizer(() =>
       EffectRuntime.forEach(pending.values(), (item) => Deferred.fail(item.deferred, new DeclinedError()), {
@@ -219,6 +257,7 @@ const layer = Layer.effect(
         EffectRuntime.gen(function* () {
           const existing = pending.get(input.requestID)
           if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
+          pending.delete(input.requestID)
           yield* events.publish(Event.Replied, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
@@ -230,7 +269,6 @@ const layer = Layer.effect(
               existing.deferred,
               input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
             )
-            pending.delete(input.requestID)
             for (const [id, item] of pending) {
               if (item.request.sessionID !== existing.request.sessionID) continue
               yield* events.publish(Event.Replied, {
@@ -252,7 +290,6 @@ const layer = Layer.effect(
             })
           }
           yield* Deferred.succeed(existing.deferred, undefined)
-          pending.delete(input.requestID)
           if (input.reply !== "always" || !existing.request.save?.length) return
 
           const rememberedRules = yield* savedRules()
