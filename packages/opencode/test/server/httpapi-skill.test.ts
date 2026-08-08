@@ -1178,6 +1178,79 @@ describe("skill HttpApi", () => {
     }
   })
 
+  test("settles a concurrent explicit reply and runtime allow exactly once without fan-out or saved approval", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/race", "ticket-6-race", "Race skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({ formatter: false, lsp: false, permission: { skill: "ask", bash: "ask" } }),
+      ),
+    ])
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    const controller = new AbortController()
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const session = await sdk.v2.session.create(
+        { agent: "build", location: { directory: project.path } },
+        { throwOnError: true },
+      )
+      const sessionID = session.data.data.id
+      await sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true })
+      const events = await sdk.v2.event.subscribe({ signal: controller.signal })
+      const iterator = events.stream[Symbol.asyncIterator]()
+      await iterator.next()
+      const [raced, unrelated] = await Promise.all([
+        sdk.v2.session.permission.create(
+          { sessionID, agent: "build", action: "skill", resources: ["ticket-6-race"] },
+          { throwOnError: true },
+        ),
+        sdk.v2.session.permission.create(
+          { sessionID, agent: "build", action: "bash", resources: ["echo"] },
+          { throwOnError: true },
+        ),
+      ])
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-race", effect: "ask" },
+        { throwOnError: true },
+      )
+      const settled = await Promise.allSettled([
+        sdk.v2.session.permission.reply(
+          { sessionID, requestID: raced.data.data.id, reply: "once" },
+          { throwOnError: true },
+        ),
+        sdk.v2.skill.permission.set(
+          { agent: "build", name: "ticket-6-race", effect: "allow" },
+          { throwOnError: true },
+        ),
+      ])
+      expect(settled.filter((item) => item.status === "fulfilled")).toHaveLength(2)
+      const pending = await sdk.v2.session.permission.list({ sessionID }, { throwOnError: true })
+      expect(pending.data.data.map((item) => item.id)).toEqual([unrelated.data.data.id])
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-race", effect: "ask" },
+        { throwOnError: true },
+      )
+      const after = await sdk.v2.session.permission.create(
+        { sessionID, agent: "build", action: "skill", resources: ["ticket-6-race"] },
+        { throwOnError: true },
+      )
+      expect(after.data.data.effect).toBe("ask")
+      const replies: unknown[] = []
+      const observed: unknown[] = []
+      for (const _ of Array.from({ length: 6 })) {
+        const next = await iterator.next()
+        const event = next.value as { type?: string; data?: { requestID?: string } }
+        observed.push(event)
+        if (event.type === "permission.v2.replied" && event.data?.requestID === raced.data.data.id) replies.push(event)
+      }
+      expect(replies, JSON.stringify(observed)).toHaveLength(1)
+    } finally {
+      controller.abort()
+      await listener.stop()
+    }
+  })
+
   it.live(
     "keeps wildcard characters in runtime skill names exact for legacy turns",
     () =>
