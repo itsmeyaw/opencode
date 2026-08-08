@@ -762,6 +762,243 @@ describe("skill HttpApi", () => {
   )
 
   it.live(
+    "releases a pending legacy skill call when the runtime permission becomes allow",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const project = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        yield* Effect.promise(() =>
+          Promise.all([
+            writeSkill(project.path, ".opencode/skills/pending", "ticket-6-legacy", "Pending legacy skill"),
+            Bun.write(
+              path.join(project.path, "opencode.json"),
+              JSON.stringify({ ...testProviderConfig(llm.url), permission: { skill: "ask" } }),
+            ),
+          ]),
+        )
+        const listener = yield* Effect.acquireRelease(
+          Effect.promise(() => Server.listen({ hostname: "127.0.0.1", port: 0 })),
+          (server) => Effect.promise(() => server.stop()),
+        )
+        const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+        const controller = new AbortController()
+        const events = yield* Effect.promise(() => sdk.event.subscribe(undefined, { signal: controller.signal }))
+        const iterator = events.stream[Symbol.asyncIterator]()
+        expect((yield* Effect.promise(() => iterator.next())).value?.type).toBe("server.connected")
+        yield* Effect.promise(() =>
+          sdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy", effect: "ask" },
+            { throwOnError: true },
+          ),
+        )
+        const session = yield* Effect.promise(() =>
+          sdk.session.create({ title: "Pending legacy skill" }, { throwOnError: true }),
+        )
+        yield* llm.toolMatch(
+          (hit) => JSON.stringify(hit.body).includes("load the pending skill"),
+          "skill",
+          { name: "ticket-6-legacy" },
+        )
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("load the pending skill"),
+          "legacy skill completed",
+        )
+        const prompt = yield* Effect.promise(() =>
+          sdk.session.prompt(
+            {
+              sessionID: session.data.id,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "load the pending skill" }],
+            },
+            { throwOnError: true },
+          ),
+        ).pipe(Effect.forkScoped)
+        const request = yield* pollWithTimeout(
+          Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
+            Effect.map((result) => result.data.find((item) => item.sessionID === session.data.id)),
+          ),
+          "legacy skill request did not become pending",
+        )
+
+        yield* Effect.promise(() =>
+          sdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-6-legacy", effect: "allow" },
+            { throwOnError: true },
+          ),
+        )
+
+        const pending = yield* Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true }))
+        expect(pending.data.map((item) => item.id)).not.toContain(request.id)
+        const reply = yield* Effect.promise(() =>
+          Promise.race([
+            (async () => {
+              while (true) {
+                const item = await iterator.next()
+                if (item.done) throw new Error("Event stream closed before legacy permission reply")
+                const payload = (item.value as { payload?: { type: string; properties: unknown } }).payload ?? item.value
+                if (payload.type === "permission.replied") return payload
+              }
+            })(),
+            Bun.sleep(2_000).then(() => {
+              throw new Error("Timed out waiting for legacy permission reply event")
+            }),
+          ]),
+        )
+        expect(reply).toMatchObject({ properties: { requestID: request.id, reply: "once" } })
+        yield* Effect.promise(() => iterator.return?.())
+        controller.abort()
+        yield* Fiber.join(prompt)
+      }),
+    20_000,
+  )
+
+  it.live(
+    "keeps or rejects real pending legacy skill calls for ask and deny overrides",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const project = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        yield* Effect.promise(() =>
+          Promise.all([
+            writeSkill(project.path, ".opencode/skills/pending", "ticket-6-legacy-effects", "Pending legacy skill"),
+            Bun.write(
+              path.join(project.path, "opencode.json"),
+              JSON.stringify({ ...testProviderConfig(llm.url), permission: { skill: "ask" } }),
+            ),
+          ]),
+        )
+        const listener = yield* Effect.acquireRelease(
+          Effect.promise(() => Server.listen({ hostname: "127.0.0.1", port: 0 })),
+          (server) => Effect.promise(() => server.stop()),
+        )
+        const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+        const set = (effect: "ask" | "deny") =>
+          Effect.promise(() =>
+            sdk.v2.skill.permission.set(
+              { agent: "build", name: "ticket-6-legacy-effects", effect },
+              { throwOnError: true },
+            ),
+          )
+        const prompt = (title: string) =>
+          Effect.gen(function* () {
+            const session = yield* Effect.promise(() => sdk.session.create({ title }, { throwOnError: true }))
+            yield* llm.toolMatch(
+              (hit) => JSON.stringify(hit.body).includes(title),
+              "skill",
+              { name: "ticket-6-legacy-effects" },
+            )
+            yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes(title), `${title} completed`)
+            const running = yield* Effect.promise(() =>
+              sdk.session.prompt(
+                {
+                  sessionID: session.data.id,
+                  agent: "build",
+                  model: { providerID: "test", modelID: "test-model" },
+                  parts: [{ type: "text", text: title }],
+                },
+                { throwOnError: true },
+              ),
+            ).pipe(Effect.forkScoped)
+            const request = yield* pollWithTimeout(
+              Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
+                Effect.map((result) => result.data.find((item) => item.sessionID === session.data.id)),
+              ),
+              `${title} request did not become pending`,
+            )
+            return { running, request }
+          })
+
+        yield* set("ask")
+        const asked = yield* prompt("Keep pending legacy skill")
+        yield* set("ask")
+        const pending = yield* Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true }))
+        expect(pending.data.map((item) => item.id)).toContain(asked.request.id)
+        yield* Effect.promise(() =>
+          sdk.permission.reply({ requestID: asked.request.id, reply: "once" }, { throwOnError: true }),
+        )
+        yield* Fiber.join(asked.running)
+
+        yield* set("ask")
+        const denied = yield* prompt("Reject pending legacy skill")
+        yield* set("deny")
+        const after = yield* Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true }))
+        expect(after.data.map((item) => item.id)).not.toContain(denied.request.id)
+        yield* Fiber.join(denied.running)
+      }),
+    30_000,
+  )
+
+  test("reconciles only matching V2 skill requests for each runtime effect", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/target", "ticket-6-v2", "Target V2 skill"),
+      writeSkill(project.path, ".opencode/skills/other", "ticket-6-other", "Other V2 skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({ formatter: false, lsp: false, permission: { skill: "ask", bash: "ask" } }),
+      ),
+    ])
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const session = await sdk.v2.session.create(
+        { agent: "build", location: { directory: project.path } },
+        { throwOnError: true },
+      )
+      const sessionID = session.data.data.id
+      const request = (action: "skill" | "bash", resource: string) =>
+        sdk.v2.session.permission.create(
+          { sessionID, action, resources: [resource], agent: "build" },
+          { throwOnError: true },
+        )
+      const pending = async () =>
+        (await sdk.v2.session.permission.list({ sessionID }, { throwOnError: true })).data.data.map((item) => item.id)
+
+      const allowed = await request("skill", "ticket-6-v2")
+      const otherSkill = await request("skill", "ticket-6-other")
+      const otherAction = await request("bash", "echo")
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-v2", effect: "allow" },
+        { throwOnError: true },
+      )
+      expect(await pending()).toEqual(expect.arrayContaining([otherSkill.data.data.id, otherAction.data.data.id]))
+      expect(await pending()).not.toContain(allowed.data.data.id)
+
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-v2", effect: "ask" },
+        { throwOnError: true },
+      )
+      const denied = await request("skill", "ticket-6-v2")
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-v2", effect: "deny" },
+        { throwOnError: true },
+      )
+      expect(await pending()).not.toContain(denied.data.data.id)
+
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-v2", effect: "ask" },
+        { throwOnError: true },
+      )
+      const asked = await request("skill", "ticket-6-v2")
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-6-v2", effect: "ask" },
+        { throwOnError: true },
+      )
+      expect(await pending()).toContain(asked.data.data.id)
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  it.live(
     "keeps wildcard characters in runtime skill names exact for legacy turns",
     () =>
       Effect.gen(function* () {

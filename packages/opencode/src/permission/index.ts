@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Deferred, Effect, Layer, Context } from "effect"
+import { Deferred, Effect, Layer, Context, Stream } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -30,12 +30,18 @@ export interface Interface {
 interface PendingEntry {
   info: PermissionV1.Request
   agent?: string
+  location: { readonly directory: string; readonly workspaceID?: string }
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
 }
 
 interface State {
   pending: Map<PermissionV1.ID, PendingEntry>
   approved: PermissionV1.Rule[]
+  changes: Map<string, number>
+}
+
+function skillChangeKey(location: PendingEntry["location"], agent: string, name: string) {
+  return `${location.directory}\u0000${location.workspaceID ?? ""}\u0000${agent}\u0000${name}`
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
@@ -63,7 +69,48 @@ const layer = Layer.effect(
         const state = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
+          changes: new Map<string, number>(),
         }
+
+        yield* events.subscribe(Skill.Event.PermissionUpdated).pipe(
+          Stream.runForEach((event) =>
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                const key = skillChangeKey(
+                  { directory: event.location?.directory ?? "", workspaceID: event.location?.workspaceID },
+                  event.data.agent,
+                  event.data.name,
+                )
+                state.changes.set(key, (state.changes.get(key) ?? 0) + 1)
+                if (event.data.effect === "ask") return
+                for (const [id, item] of state.pending) {
+                  if (
+                    item.info.permission !== "skill" ||
+                    item.agent !== event.data.agent ||
+                    item.location.directory !== event.location?.directory ||
+                    item.location.workspaceID !== event.location?.workspaceID ||
+                    item.info.patterns.length === 0 ||
+                    !item.info.patterns.every((pattern) => pattern === event.data.name)
+                  )
+                    continue
+                  state.pending.delete(id)
+                  const reply = event.data.effect === "allow" ? "once" : "reject"
+                  yield* events.publish(Event.Replied, {
+                    sessionID: item.info.sessionID,
+                    requestID: item.info.id,
+                    reply,
+                  })
+                  if (reply === "once") {
+                    yield* Deferred.succeed(item.deferred, undefined)
+                    continue
+                  }
+                  yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+                }
+              }),
+            ),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        )
 
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
@@ -99,7 +146,8 @@ const layer = Layer.effect(
     })
 
     const ask = Effect.fn("Permission.ask")(function* (input: AskInput) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, pending, changes: skillChanges } = yield* InstanceState.get(state)
+      const location = yield* InstanceState.location
       const { ruleset, agent, ...request } = input
       const skills =
         request.permission === "skill" && agent
@@ -110,6 +158,10 @@ const layer = Layer.effect(
               ]),
             )
           : undefined
+      const changes =
+        request.permission === "skill" && agent
+          ? request.patterns.map((name) => [name, skillChanges.get(skillChangeKey(location, agent, name)) ?? 0] as const)
+          : []
       let needsAsk = false
 
       for (const pattern of request.patterns) {
@@ -141,8 +193,31 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, agent, deferred })
+      pending.set(id, { info, agent, location, deferred })
       yield* events.publish(Event.Asked, info)
+      if (
+        request.permission === "skill" &&
+        agent &&
+        changes.some(([name, version]) => version !== (skillChanges.get(skillChangeKey(location, agent, name)) ?? 0))
+      ) {
+        const states = yield* resolveSkills({ agent, sessionID: request.sessionID, names: request.patterns })
+        const effects = states.map((state) => state.effect)
+        const effect = effects.includes("deny") ? "deny" : effects.includes("ask") ? "ask" : "allow"
+        if (effect !== "ask") {
+          const existing = pending.get(id)
+          if (existing) {
+            pending.delete(id)
+            const reply = effect === "allow" ? "once" : "reject"
+            yield* events.publish(Event.Replied, {
+              sessionID: existing.info.sessionID,
+              requestID: existing.info.id,
+              reply,
+            })
+            if (reply === "once") yield* Deferred.succeed(existing.deferred, undefined)
+            if (reply === "reject") yield* Deferred.fail(existing.deferred, new PermissionV1.RejectedError())
+          }
+        }
+      }
       return yield* Effect.ensuring(
         Deferred.await(deferred),
         Effect.sync(() => {

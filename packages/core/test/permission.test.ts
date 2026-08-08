@@ -9,7 +9,9 @@ import { Location } from "@opencode-ai/core/location"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { PermissionTable } from "@opencode-ai/core/permission/sql"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
+import { SkillPermission } from "@opencode-ai/core/permission/skill"
 import { Project } from "@opencode-ai/core/project"
+import { Skill } from "@opencode-ai/schema/skill"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -34,6 +36,57 @@ const it = testEffect(
       PermissionV2.node,
     ]),
     [[Location.node, current]],
+  ),
+)
+
+let changedDuringEvaluation = false
+const race = testEffect(
+  AppNodeBuilder.build(
+    LayerNode.group([
+      Database.node,
+      EventV2.node,
+      SessionStore.node,
+      PermissionSaved.node,
+      AgentV2.node,
+      PermissionV2.node,
+    ]),
+    [
+      [Location.node, current],
+      [
+        SkillPermission.node,
+        Layer.effect(
+          SkillPermission.Service,
+          Effect.gen(function* () {
+            const events = yield* EventV2.Service
+            return SkillPermission.Service.of({
+              list: () => Effect.die("not used"),
+              set: () => Effect.die("not used"),
+              resolve: () =>
+                Effect.gen(function* () {
+                  if (!changedDuringEvaluation) {
+                    changedDuringEvaluation = true
+                    yield* events.publish(Skill.Event.PermissionUpdated, {
+                      agent: AgentV2.ID.make("test"),
+                      name: "race",
+                      effect: "allow",
+                    })
+                    return {
+                      agent: AgentV2.ID.make("test"),
+                      states: [{ name: "race", effect: "ask" }],
+                      rules: [],
+                    }
+                  }
+                  return {
+                    agent: AgentV2.ID.make("test"),
+                    states: [{ name: "race", effect: "allow" }],
+                    rules: [],
+                  }
+                }),
+            })
+          }),
+        ),
+      ],
+    ],
   ),
 )
 
@@ -103,6 +156,29 @@ function waitForRequest() {
 }
 
 describe("PermissionV2", () => {
+  race.effect("rechecks a skill permission update that arrives before pending registration", () =>
+    Effect.gen(function* () {
+      changedDuringEvaluation = false
+      yield* setup()
+      const service = yield* PermissionV2.Service
+      const events = yield* EventV2.Service
+      const replied = yield* Deferred.make<PermissionV2.Reply>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === PermissionV2.Event.Replied.type
+          ? Deferred.succeed(replied, (event.data as { reply: PermissionV2.Reply }).reply).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      expect(
+        yield* service.ask(
+          assertion({ action: "skill", resources: ["race"], agent: AgentV2.ID.make("test") }),
+        ),
+      ).toEqual({ id: PermissionV2.ID.create("per_test"), effect: "ask" })
+      expect(yield* service.get(PermissionV2.ID.create("per_test"))).toBeUndefined()
+      expect(yield* Deferred.await(replied)).toBe("once")
+    }),
+  )
+
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])
