@@ -16,11 +16,13 @@ import { EventV2 } from "../../event"
 import { Location } from "../../location"
 import { ModelV2 } from "../../model"
 import { PermissionV2 } from "../../permission"
+import { SkillPermission } from "../../permission/skill"
 import { ProviderV2 } from "../../provider"
 import { QuestionV2 } from "../../question"
 import { SystemContext } from "../../system-context/index"
 import { SystemContextRegistry } from "../../system-context/registry"
 import { SkillGuidance } from "../../skill/guidance"
+import { SkillV2 } from "../../skill"
 import { ReferenceGuidance } from "../../reference/guidance"
 import { ToolRegistry } from "../../tool/registry"
 import { ToolOutputStore } from "../../tool-output-store"
@@ -102,6 +104,8 @@ const layer = Layer.effect(
     const location = yield* Location.Service
     const systemContext = yield* SystemContextRegistry.Service
     const skillGuidance = yield* SkillGuidance.Service
+    const skills = yield* SkillV2.Service
+    const skillPermission = yield* SkillPermission.Service
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
@@ -200,7 +204,24 @@ const layer = Layer.effect(
       const entries = yield* SessionHistory.entriesForRunner(db, session.id, system.baselineSeq)
       const context = entries.map((entry) => entry.message)
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
-      const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
+      const discoveredSkills = yield* skills.list()
+      const skillResolution = yield* skillPermission
+        .resolve({
+          agent: agent.id,
+          sessionID: session.id,
+          names: discoveredSkills.map((skill) => skill.name),
+        })
+        .pipe(Effect.orDie)
+      const toolMaterialization = isLastStep
+        ? undefined
+        : yield* tools.materialize([
+            ...(agent.info?.permissions ?? []),
+            {
+              action: "skill",
+              resource: "*",
+              effect: skillResolution.states.some((state) => state.effect !== "deny") ? "allow" : "deny",
+            },
+          ])
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
       const request = LLM.request({
         model,
@@ -424,6 +445,8 @@ export const node = makeLocationNode({
     Location.node,
     SystemContextRegistry.node,
     SkillGuidance.node,
+    SkillV2.node,
+    SkillPermission.node,
     ReferenceGuidance.node,
     Config.node,
     Snapshot.node,

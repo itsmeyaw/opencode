@@ -10,9 +10,11 @@ import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable, SessionTable } from "./sql"
 import { fromRow } from "./info"
+import { Permission } from "@opencode-ai/schema/permission"
 
 export interface Interface {
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info | undefined>
+  readonly permissions: (sessionID: SessionSchema.ID) => Effect.Effect<Permission.Ruleset>
   readonly context: (sessionID: SessionSchema.ID) => Effect.Effect<SessionMessage.Message[], MessageDecodeError>
   readonly runnerContext: (
     sessionID: SessionSchema.ID,
@@ -35,6 +37,19 @@ const layer = Layer.effect(
       get: Effect.fn("SessionStore.get")(function* (sessionID) {
         const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
         return row ? fromRow(row) : undefined
+      }),
+      permissions: Effect.fn("SessionStore.permissions")(function* (sessionID) {
+        const row = yield* db
+          .select({ permission: SessionTable.permission })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        return (row?.permission ?? []).map((rule) => ({
+          action: rule.permission,
+          resource: rule.pattern,
+          effect: rule.action,
+        }))
       }),
       context: Effect.fn("SessionStore.context")(function* (sessionID) {
         return yield* SessionHistory.load(db, sessionID)

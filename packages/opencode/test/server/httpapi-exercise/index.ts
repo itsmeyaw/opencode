@@ -730,6 +730,25 @@ const scenarios: Scenario[] = [
   http.protected.get("/api/command", "v2.command.list").json(200, locationData(array)),
   http.protected.get("/api/skill", "v2.skill.list").json(200, locationData(array)),
   http.protected
+    .get("/api/skill/permission", "v2.skill.permission.list")
+    .at((ctx) => ({ path: "/api/skill/permission?agent=build", headers: ctx.headers() }))
+    .json(200, locationData(array)),
+  http.protected
+    .put("/api/skill/permission", "v2.skill.permission.set")
+    .at((ctx) => ({
+      path: "/api/skill/permission",
+      headers: ctx.headers(),
+      body: { agent: "build", name: "review", effect: "allow" },
+    }))
+    .json(
+      200,
+      locationData((value) => {
+        object(value)
+        check(value.name === "review", "skill permission mutation should return the exact skill")
+        check(value.effect === "allow", "skill permission mutation should return the authoritative effect")
+      }),
+    ),
+  http.protected
     .get("/api/event", "v2.event.subscribe")
     .stream()
     .status(

@@ -1,6 +1,9 @@
 export * as Skill from "./skill"
 
 import { Schema } from "effect"
+import { Agent } from "./agent"
+import { define, inventory } from "./event"
+import { Permission } from "./permission"
 import { optional } from "./schema"
 import { AbsolutePath } from "./schema"
 
@@ -24,6 +27,27 @@ export const Info = Schema.Struct({
   location: AbsolutePath,
   content: Schema.String,
 }).annotate({ identifier: "SkillV2.Info" })
+
+export interface PermissionInfo extends Schema.Schema.Type<typeof PermissionInfo> {}
+export const PermissionInfo = Schema.Struct({
+  ...Info.fields,
+  effect: Permission.Effect,
+}).annotate({ identifier: "Skill.PermissionInfo" })
+
+export interface PermissionState extends Schema.Schema.Type<typeof PermissionState> {}
+export const PermissionState = Schema.Struct({
+  name: Schema.String,
+  effect: Permission.Effect,
+}).annotate({ identifier: "Skill.PermissionState" })
+
+const PermissionUpdated = define({
+  type: "skill.permission.updated",
+  schema: {
+    agent: Agent.ID,
+    ...PermissionState.fields,
+  },
+})
+export const Event = { PermissionUpdated, Definitions: inventory(PermissionUpdated) }
 
 export interface EmbeddedSource extends Schema.Schema.Type<typeof EmbeddedSource> {}
 export const EmbeddedSource = Schema.Struct({

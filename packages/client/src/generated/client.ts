@@ -85,6 +85,10 @@ import type {
   CommandsListOutput,
   SkillsListInput,
   SkillsListOutput,
+  SkillsPermissionsInput,
+  SkillsPermissionsOutput,
+  SkillsSetPermissionInput,
+  SkillsSetPermissionOutput,
   EventsSubscribeOutput,
   PtysListInput,
   PtysListOutput,
@@ -801,6 +805,31 @@ export function make(options: ClientOptions) {
             method: "GET",
             path: `/api/skill`,
             query: { location: input?.["location"] },
+            successStatus: 200,
+            declaredStatuses: [401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      permissions: (input: SkillsPermissionsInput, requestOptions?: RequestOptions) =>
+        request<SkillsPermissionsOutput>(
+          {
+            method: "GET",
+            path: `/api/skill/permission`,
+            query: { location: input["location"], agent: input["agent"], sessionID: input["sessionID"] },
+            successStatus: 200,
+            declaredStatuses: [404, 401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      setPermission: (input: SkillsSetPermissionInput, requestOptions?: RequestOptions) =>
+        request<SkillsSetPermissionOutput>(
+          {
+            method: "PUT",
+            path: `/api/skill/permission`,
+            query: { location: input["location"] },
+            body: { agent: input["agent"], name: input["name"], effect: input["effect"] },
             successStatus: 200,
             declaredStatuses: [401, 400],
             empty: false,

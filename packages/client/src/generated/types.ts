@@ -2538,6 +2538,62 @@ export type SkillsListOutput = {
   }>
 }
 
+export type SkillsPermissionsInput = {
+  readonly location?: {
+    readonly location?: { readonly directory?: string | undefined; readonly workspace?: string | undefined } | undefined
+    readonly agent: string
+    readonly sessionID?: string | undefined
+  }["location"]
+  readonly agent: {
+    readonly location?: { readonly directory?: string | undefined; readonly workspace?: string | undefined } | undefined
+    readonly agent: string
+    readonly sessionID?: string | undefined
+  }["agent"]
+  readonly sessionID?: {
+    readonly location?: { readonly directory?: string | undefined; readonly workspace?: string | undefined } | undefined
+    readonly agent: string
+    readonly sessionID?: string | undefined
+  }["sessionID"]
+}
+
+export type SkillsPermissionsOutput = {
+  readonly location: {
+    readonly directory: string
+    readonly workspaceID?: string
+    readonly project: { readonly id: string; readonly directory: string }
+  }
+  readonly data: ReadonlyArray<{
+    readonly name: string
+    readonly description?: string
+    readonly slash?: boolean
+    readonly location: string
+    readonly content: string
+    readonly effect: "allow" | "deny" | "ask"
+  }>
+}
+
+export type SkillsSetPermissionInput = {
+  readonly location?: {
+    readonly location?: { readonly directory?: string | undefined; readonly workspace?: string | undefined } | undefined
+  }["location"]
+  readonly agent: { readonly agent: string; readonly name: string; readonly effect: "allow" | "deny" | "ask" }["agent"]
+  readonly name: { readonly agent: string; readonly name: string; readonly effect: "allow" | "deny" | "ask" }["name"]
+  readonly effect: {
+    readonly agent: string
+    readonly name: string
+    readonly effect: "allow" | "deny" | "ask"
+  }["effect"]
+}
+
+export type SkillsSetPermissionOutput = {
+  readonly location: {
+    readonly directory: string
+    readonly workspaceID?: string
+    readonly project: { readonly id: string; readonly directory: string }
+  }
+  readonly data: { readonly name: string; readonly effect: "allow" | "deny" | "ask" }
+}
+
 export type EventsSubscribeOutput = OpenCodeEventEncoded
 
 export type PtysListInput = {

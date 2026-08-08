@@ -10,9 +10,11 @@ import { SessionV2 } from "./session"
 import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
 import { PermissionSaved } from "./permission/saved"
+import { SkillPermission } from "./permission/skill"
+import { evaluate, merge, missingAgentPermissions } from "./permission/evaluate"
 
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
-const missingAgentPermissions: Permission.Ruleset = [{ action: "*", resource: "*", effect: "deny" }]
+export { evaluate, merge } from "./permission/evaluate"
 
 export const ID = Permission.ID
 export type ID = typeof ID.Type
@@ -73,22 +75,6 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Per
 
 export type Error = BlockedError | CorrectedError
 
-export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
-  return (
-    rulesets
-      .flat()
-      .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
-      action,
-      resource: "*",
-      effect: "ask",
-    }
-  )
-}
-
-export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
-  return rulesets.flat()
-}
-
 export interface Interface {
   readonly ask: (input: AssertInput) => EffectRuntime.Effect<AskResult, SessionV2.NotFoundError>
   readonly assert: (input: AssertInput) => EffectRuntime.Effect<void, Error | SessionV2.NotFoundError>
@@ -114,6 +100,7 @@ const layer = Layer.effect(
     const agents = yield* AgentV2.Service
     const sessions = yield* SessionStore.Service
     const saved = yield* PermissionSaved.Service
+    const skillPermission = yield* SkillPermission.Service
     const pending = new Map<ID, Pending>()
 
     yield* EffectRuntime.addFinalizer(() =>
@@ -153,6 +140,16 @@ const layer = Layer.effect(
     }
 
     const evaluateInput = EffectRuntime.fnUntraced(function* (input: AssertInput) {
+      if (input.action === "skill") {
+        const result = yield* skillPermission.resolve({
+          agent: input.agent,
+          sessionID: input.sessionID,
+          names: input.resources,
+        })
+        const effects = result.states.map((state) => state.effect)
+        const effect: Permission.Effect = effects.includes("deny") ? "deny" : effects.includes("ask") ? "ask" : "allow"
+        return { effect, rules: result.rules }
+      }
       const rules = yield* configured(input.sessionID, input.agent)
       if (denied(input, rules)) return { effect: "deny" as const, rules }
       const all = [...rules, ...(yield* savedRules())]
@@ -306,5 +303,5 @@ export const locationLayer = layer.pipe(Layer.provideMerge(AgentV2.locationLayer
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node],
+  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node, SkillPermission.node],
 })
