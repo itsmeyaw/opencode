@@ -1,6 +1,7 @@
 import { TextAttributes } from "@opentui/core"
 import { DialogSelect, type DialogSelectOption } from "../ui/dialog-select"
-import { createResource, createMemo, createSignal } from "solid-js"
+import { createResource, createMemo, createSignal, onCleanup } from "solid-js"
+import { useEvent } from "../context/event"
 import { useDialog } from "../ui/dialog"
 import { useSDK } from "../context/sdk"
 import { useTheme } from "../context/theme"
@@ -41,6 +42,7 @@ function Status(props: { effect: PermissionV2Effect; loading: boolean }) {
 export function DialogSkill(props: DialogSkillProps) {
   const dialog = useDialog()
   const sdk = useSDK()
+  const event = useEvent()
   const toast = useToast()
   const { theme } = useTheme()
   dialog.setSize("large")
@@ -51,7 +53,7 @@ export function DialogSkill(props: DialogSkillProps) {
   const load = (request: PermissionRequest) =>
     sdk.client.v2.skill.permission.list(request, { throwOnError: true }).then((result) => result.data.data)
 
-  const [skills, { mutate }] = createResource(
+  const [skills, { mutate, refetch }] = createResource(
     () => ({
       agent: props.agent,
       sessionID: props.sessionID,
@@ -73,6 +75,15 @@ export function DialogSkill(props: DialogSkillProps) {
 
   const showError = createMemo(() => Boolean(loadError()))
   const showLoading = createMemo(() => skills.loading)
+
+  onCleanup(
+    event.on("skill.permission.updated", (update, metadata) => {
+      if (metadata.directory !== props.location.directory) return
+      if (metadata.workspace !== props.location.workspaceID) return
+      if (update.properties.agent !== props.agent) return
+      void refetch()
+    }),
+  )
 
   const options = createMemo<DialogSelectOption<string>[]>(() => {
     if (showError() || showLoading()) return []

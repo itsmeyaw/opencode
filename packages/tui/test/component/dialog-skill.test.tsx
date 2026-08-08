@@ -18,7 +18,7 @@ import { Toast, ToastProvider } from "../../src/ui/toast"
 import { tmpdir } from "../fixture/fixture"
 import { TestTuiContexts } from "../fixture/tui-environment"
 import { createTuiResolvedConfig } from "../fixture/tui-runtime"
-import { directory, eventSource, json } from "../fixture/tui-sdk"
+import { createEventSource, directory, eventSource, json } from "../fixture/tui-sdk"
 
 const location = { directory, project: { id: "proj_test", directory } }
 
@@ -36,6 +36,7 @@ async function mountDialog(input: {
   agent?: string
   sessionID?: string
   location?: { directory: string; workspaceID?: string }
+  events?: ReturnType<typeof createEventSource>["source"]
   keybinds?: Partial<TuiKeybind.Keybinds>
   onSelect?: (skill: string) => void
 }) {
@@ -68,7 +69,7 @@ async function mountDialog(input: {
 
     return (
       <TestTuiContexts paths={{ home: input.root, state, worktree: input.root }}>
-        <SDKProvider url="http://test" directory={directory} events={eventSource()} fetch={input.fetch}>
+        <SDKProvider url="http://test" directory={directory} events={input.events ?? eventSource()} fetch={input.fetch}>
           <OpencodeKeymapProvider keymap={keymap}>
             <TuiConfigProvider config={config}>
               <KVProvider>
@@ -250,6 +251,62 @@ test("cycles the selected permission with Space and refreshes authoritative stat
         .split("\n")
         .find((line) => line.includes("deploy")),
     ).toContain("Ask")
+  } finally {
+    await dialog.cleanup()
+  }
+})
+
+test("refreshes an open dialog from matching external skill permission events", async () => {
+  await using tmp = await tmpdir()
+  const events = createEventSource()
+  const requestLocation = { directory: "/tmp/moved", workspaceID: "wrk_test" }
+  let effect = "ask"
+  let reads = 0
+  const fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.pathname !== "/api/skill/permission") throw new Error(`unexpected request: ${url.pathname}`)
+    reads++
+    return json({
+      location,
+      data: [
+        {
+          name: "review",
+          description: "Review changes",
+          location: "/skills/review/SKILL.md",
+          content: "# Review",
+          effect,
+        },
+      ],
+    })
+  }) as typeof globalThis.fetch
+  const dialog = await mountDialog({ root: tmp.path, fetch, location: requestLocation, events: events.source })
+
+  try {
+    await wait(() => dialog.app.captureCharFrame().includes("Ask"))
+    events.emit({
+      directory: "/tmp/unrelated",
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_unrelated",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    await Bun.sleep(20)
+    expect(reads).toBe(1)
+
+    effect = "deny"
+    events.emit({
+      directory: requestLocation.directory,
+      workspace: requestLocation.workspaceID,
+      payload: {
+        id: "evt_matching",
+        type: "skill.permission.updated",
+        properties: { agent: "build", name: "review", effect: "deny" },
+      },
+    })
+    await wait(() => reads === 2 && dialog.app.captureCharFrame().includes("Denied"), "external refresh")
+    expect(dialog.app.captureCharFrame()).toContain("Skills")
   } finally {
     await dialog.cleanup()
   }
