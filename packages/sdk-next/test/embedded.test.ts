@@ -230,18 +230,19 @@ test.serial("embedded transport adapts generated SDK skill permissions and event
         Effect.gen(function* () {
           const opencode = yield* OpenCode.create()
           const events: Array<{ payload?: { type?: string; properties?: { name?: string; effect?: string } } }> = []
-          const unsubscribe = yield* Effect.promise(() =>
-            opencode.transport.events.subscribe((event) =>
-              events.push(event as { payload?: { type?: string; properties?: { name?: string; effect?: string } } }),
+          const connected = Promise.withResolvers<void>()
+          const updated = Promise.withResolvers<void>()
+          yield* Effect.acquireRelease(
+            Effect.promise(() =>
+              opencode.transport.events.subscribe((event) => {
+                events.push(event as { payload?: { type?: string; properties?: { name?: string; effect?: string } } })
+                if ((event as { payload?: { type?: string } }).payload?.type === "server.connected") connected.resolve()
+                if ((event as { payload?: { type?: string } }).payload?.type === "skill.permission.updated") updated.resolve()
+              }),
             ),
+            (unsubscribe) => Effect.sync(unsubscribe),
           )
-          yield* Effect.promise(async () => {
-            const start = Date.now()
-            while (!events.some((event) => event.payload?.type === "server.connected")) {
-              if (Date.now() - start > 2_000) throw new Error("embedded event transport did not connect")
-              await Bun.sleep(10)
-            }
-          })
+          yield* Effect.promise(() => connected.promise)
           const sdk = createOpencodeClient({
             baseUrl: "http://opencode.local",
             directory,
@@ -261,18 +262,11 @@ test.serial("embedded transport adapts generated SDK skill permissions and event
             sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true }),
           )
           expect(after.data.data.find((skill) => skill.name === "embedded-transport")?.effect).toBe("allow")
-          yield* Effect.promise(async () => {
-            const start = Date.now()
-            while (!events.some((event) => event.payload?.type === "skill.permission.updated")) {
-              if (Date.now() - start > 2_000) throw new Error("embedded skill permission event did not arrive")
-              await Bun.sleep(10)
-            }
-          })
+          yield* Effect.promise(() => updated.promise)
           expect(events.find((event) => event.payload?.type === "skill.permission.updated")?.payload?.properties).toMatchObject({
             name: "embedded-transport",
             effect: "allow",
           })
-          yield* Effect.sync(unsubscribe)
         }),
       ),
     )

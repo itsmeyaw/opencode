@@ -736,9 +736,13 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
   await using tmp = await tmpdir()
   const database = Flag.OPENCODE_DB
   const config = process.env.OPENCODE_CONFIG_DIR
+  const externalSkills = process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS
+  const claudeSkills = process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
   const scope = Effect.runSync(Scope.make())
   Flag.OPENCODE_DB = path.join(tmp.path, "opencode.sqlite")
   process.env.OPENCODE_CONFIG_DIR = path.join(tmp.path, "config")
+  process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS = "true"
+  process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = "true"
   let cleanup: (() => Promise<void>) | undefined
 
   try {
@@ -749,10 +753,10 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
       path.join(tmp.path, "opencode.json"),
       JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
     )
-    await mkdir(path.join(tmp.path, ".opencode", "skills", "embedded"), { recursive: true })
+    await mkdir(path.join(tmp.path, ".opencode", "skills", "agent-eval"), { recursive: true })
     await Bun.write(
-      path.join(tmp.path, ".opencode", "skills", "embedded", "SKILL.md"),
-      "---\nname: embedded-transport\ndescription: Embedded transport skill\n---\n# Embedded",
+      path.join(tmp.path, ".opencode", "skills", "agent-eval", "SKILL.md"),
+      "---\nname: agent-eval\ndescription: Embedded agent evaluation skill\n---\n# Agent evaluation",
     )
     const opencode = await Effect.runPromise(OpenCode.create().pipe(Effect.provideService(Scope.Scope, scope)))
     const location = { directory: tmp.path }
@@ -803,7 +807,8 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
       () => requests.some((request) => request.method === "GET" && request.settled),
       "embedded authoritative read",
     )
-    await wait(() => dialog.app.captureCharFrame().includes("customize-opencode"), "embedded builtin skill")
+    "agent-eval".split("").forEach((key) => dialog.app.mockInput.pressKey(key))
+    await wait(() => dialog.app.captureCharFrame().includes("agent-eval"), "embedded fixture skill")
     const read = requests.find((request) => request.method === "GET")
     expect(read?.url.pathname).toBe("/api/skill/permission")
     expect(read?.url.searchParams.get("agent")).toBe("build")
@@ -835,5 +840,9 @@ test.serial("uses an embedded host for authoritative reads, mutations, and exter
     Flag.OPENCODE_DB = database
     if (config === undefined) delete process.env.OPENCODE_CONFIG_DIR
     else process.env.OPENCODE_CONFIG_DIR = config
+    if (externalSkills === undefined) delete process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS
+    else process.env.OPENCODE_DISABLE_EXTERNAL_SKILLS = externalSkills
+    if (claudeSkills === undefined) delete process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
+    else process.env.OPENCODE_DISABLE_CLAUDE_CODE_SKILLS = claudeSkills
   }
 })
