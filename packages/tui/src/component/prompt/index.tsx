@@ -518,8 +518,12 @@ export function Prompt(props: PromptProps) {
         category: "Prompt",
         slashName: "skills",
         run: () => {
+          const agent = local.agent.current()
+          if (!agent) return
           dialog.replace(() => (
             <DialogSkill
+              agent={local.agent.current()?.name ?? agent.name}
+              sessionID={props.sessionID}
               onSelect={(skill) => {
                 input.setText(`/${skill} `)
                 setStore("prompt", {
