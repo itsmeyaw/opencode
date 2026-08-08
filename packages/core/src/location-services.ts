@@ -17,6 +17,7 @@ import { Location } from "./location"
 import { LocationMutation } from "./location-mutation"
 import { LocationServiceMap } from "./location-service-map"
 import { PermissionV2 } from "./permission"
+import { SkillPermission } from "./permission/skill"
 import { PluginV2 } from "./plugin"
 import { PluginInternal } from "./plugin/internal"
 import { Policy } from "./policy"
@@ -65,6 +66,7 @@ export const locationServices = LayerNode.group([
   LocationMutation.node,
   FileMutation.node,
   PermissionV2.node,
+  SkillPermission.node,
   ToolOutputStore.node,
   ToolRegistry.node,
   ToolRegistry.toolsNode,

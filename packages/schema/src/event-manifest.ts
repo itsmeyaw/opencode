@@ -21,6 +21,7 @@ import { Question } from "./question"
 import { QuestionV1 } from "./question-v1"
 import { Reference } from "./reference"
 import { ServerEvent } from "./server-event"
+import { Skill } from "./skill"
 import { SessionCompactionEvent } from "./session-compaction-event"
 import { SessionEvent } from "./session-event"
 import { SessionStatusEvent } from "./session-status-event"
@@ -47,6 +48,7 @@ const featureDefinitions = Event.inventory(
   ...FileSystem.Event.Definitions,
   ...Reference.Event.Definitions,
   ...Permission.Event.Definitions,
+  ...Skill.Event.Definitions,
   ...Plugin.Event.Definitions,
   ...ProjectDirectories.Event.Definitions,
   ...FileSystemWatcher.Event.Definitions,

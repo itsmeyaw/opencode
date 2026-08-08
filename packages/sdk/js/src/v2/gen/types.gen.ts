@@ -57,6 +57,7 @@ export type Event =
   | EventReferenceUpdated
   | EventPermissionV2Asked
   | EventPermissionV2Replied
+  | EventSkillPermissionUpdated
   | EventPluginAdded
   | EventProjectDirectoriesUpdated
   | EventFileWatcherUpdated
@@ -1275,6 +1276,15 @@ export type GlobalEvent = {
           sessionID: string
           requestID: string
           reply: PermissionV2Reply
+        }
+      }
+    | {
+        id: string
+        type: "skill.permission.updated"
+        properties: {
+          agent: string
+          name: string
+          effect: PermissionV2Effect
         }
       }
     | {
@@ -2905,6 +2915,7 @@ export type V2Event =
   | ReferenceUpdated
   | PermissionV2Asked
   | PermissionV2Replied
+  | SkillPermissionUpdated
   | PluginAdded
   | ProjectDirectoriesUpdated
   | FileWatcherUpdated
@@ -3126,6 +3137,8 @@ export type PermissionV2Source = {
 }
 
 export type PermissionV2Reply = "once" | "always" | "reject"
+
+export type PermissionV2Effect = "allow" | "deny" | "ask"
 
 export type QuestionV2Option = {
   /**
@@ -3878,8 +3891,6 @@ export type ProviderRequest = {
 }
 
 export type AgentColor = string | "primary" | "secondary" | "accent" | "success" | "warning" | "error" | "info"
-
-export type PermissionV2Effect = "allow" | "deny" | "ask"
 
 export type PermissionV2Rule = {
   action: string
@@ -5021,6 +5032,20 @@ export type SkillV2Info = {
   content: string
 }
 
+export type SkillPermissionInfo = {
+  name: string
+  description?: string
+  slash?: boolean
+  location: string
+  content: string
+  effect: PermissionV2Effect
+}
+
+export type SkillPermissionState = {
+  name: string
+  effect: PermissionV2Effect
+}
+
 export type ModelsDevRefreshed = {
   id: string
   metadata?: {
@@ -5474,6 +5499,25 @@ export type PermissionV2Replied = {
     sessionID: string
     requestID: string
     reply: PermissionV2Reply
+  }
+}
+
+export type SkillPermissionUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "skill.permission.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    agent: string
+    name: string
+    effect: PermissionV2Effect
   }
 }
 
@@ -6745,6 +6789,16 @@ export type EventPermissionV2Replied = {
     sessionID: string
     requestID: string
     reply: PermissionV2Reply
+  }
+}
+
+export type EventSkillPermissionUpdated = {
+  id: string
+  type: "skill.permission.updated"
+  properties: {
+    agent: string
+    name: string
+    effect: PermissionV2Effect
   }
 }
 
@@ -12964,6 +13018,90 @@ export type V2SkillListResponses = {
 }
 
 export type V2SkillListResponse = V2SkillListResponses[keyof V2SkillListResponses]
+
+export type V2SkillPermissionListData = {
+  body?: never
+  path?: never
+  query: {
+    location?: {
+      directory?: string
+      workspace?: string
+    }
+    agent: string
+    sessionID?: string
+  }
+  url: "/api/skill/permission"
+}
+
+export type V2SkillPermissionListErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+}
+
+export type V2SkillPermissionListError = V2SkillPermissionListErrors[keyof V2SkillPermissionListErrors]
+
+export type V2SkillPermissionListResponses = {
+  /**
+   * Success
+   */
+  200: {
+    location: LocationInfo
+    data: Array<SkillPermissionInfo>
+  }
+}
+
+export type V2SkillPermissionListResponse = V2SkillPermissionListResponses[keyof V2SkillPermissionListResponses]
+
+export type V2SkillPermissionSetData = {
+  body: {
+    agent: string
+    name: string
+    effect: PermissionV2Effect
+  }
+  path?: never
+  query?: {
+    location?: {
+      directory?: string
+      workspace?: string
+    }
+  }
+  url: "/api/skill/permission"
+}
+
+export type V2SkillPermissionSetErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2SkillPermissionSetError = V2SkillPermissionSetErrors[keyof V2SkillPermissionSetErrors]
+
+export type V2SkillPermissionSetResponses = {
+  /**
+   * Success
+   */
+  200: {
+    location: LocationInfo
+    data: SkillPermissionState
+  }
+}
+
+export type V2SkillPermissionSetResponse = V2SkillPermissionSetResponses[keyof V2SkillPermissionSetResponses]
 
 export type V2EventSubscribeData = {
   body?: never

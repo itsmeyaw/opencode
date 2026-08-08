@@ -2,8 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { Server } from "../../src/server/server"
+import { Effect } from "effect"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
+import { testEffect } from "../lib/effect"
+import { TestLLMServer } from "../lib/llm-server"
+
+const it = testEffect(TestLLMServer.layer)
 
 const environment = [
   "OPENCODE_CONFIG_DIR",
@@ -222,4 +227,369 @@ describe("skill HttpApi", () => {
       await listener.stop()
     }
   })
+
+  test("reads effective skill permissions for the selected agent", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/allowed", "ticket-4-allowed", "Allowed skill"),
+      writeSkill(project.path, ".opencode/skills/asked", "ticket-4-asked", "Asked skill"),
+      writeSkill(project.path, ".opencode/skills/denied", "ticket-4-denied", "Denied skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({
+          formatter: false,
+          lsp: false,
+          permission: {
+            skill: {
+              "*": "allow",
+              "ticket-4-asked": "ask",
+              "ticket-4-denied": "deny",
+            },
+          },
+        }),
+      ),
+    ])
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const result = await sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true })
+
+      expect(
+        result.data.data
+          .filter((skill) => skill.name.startsWith("ticket-4-"))
+          .map((skill) => ({ name: skill.name, effect: skill.effect })),
+      ).toEqual([
+        { name: "ticket-4-allowed", effect: "allow" },
+        { name: "ticket-4-asked", effect: "ask" },
+        { name: "ticket-4-denied", effect: "deny" },
+      ])
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  test("sets exact agent-scoped runtime skill permissions", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/literal", "ticket-4-literal*", "Literal wildcard skill"),
+      writeSkill(project.path, ".opencode/skills/similar", "ticket-4-literal-one", "Similar skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({
+          formatter: false,
+          lsp: false,
+          permission: { skill: "deny" },
+          agent: {
+            reviewer: {
+              description: "Reviews changes",
+              mode: "primary",
+              permission: { skill: "ask" },
+            },
+          },
+        }),
+      ),
+    ])
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const config = await Bun.file(path.join(project.path, "opencode.json")).text()
+      const name = "ticket-4-literal*"
+      const set = (effect: "allow" | "deny" | "ask") =>
+        sdk.v2.skill.permission.set({ agent: "build", name, effect }, { throwOnError: true })
+
+      expect((await set("allow")).data.data).toMatchObject({ name, effect: "allow" })
+      const build = await sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true })
+      expect(build.data.data.find((skill) => skill.name === name)?.effect).toBe("allow")
+      expect(build.data.data.find((skill) => skill.name === "ticket-4-literal-one")?.effect).toBe("deny")
+      const reviewer = await sdk.v2.skill.permission.list({ agent: "reviewer" }, { throwOnError: true })
+      expect(reviewer.data.data.find((skill) => skill.name === name)?.effect).toBe("ask")
+      expect((await set("deny")).data.data).toMatchObject({ name, effect: "deny" })
+      expect((await set("ask")).data.data).toMatchObject({ name, effect: "ask" })
+      expect(await Bun.file(path.join(project.path, "opencode.json")).text()).toBe(config)
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  test("isolates runtime overrides by Location and clears them when Location services are disposed", async () => {
+    await using first = await tmpdir({ git: true })
+    await using second = await tmpdir({ git: true })
+    await Promise.all(
+      [first.path, second.path].flatMap((directory) => [
+        writeSkill(directory, ".opencode/skills/isolation", "ticket-4-isolation", "Isolated skill"),
+        Bun.write(
+          path.join(directory, "opencode.json"),
+          JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
+        ),
+      ]),
+    )
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const firstSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: first.path })
+      const secondSdk = createOpencodeClient({ baseUrl: listener.url.href, directory: second.path })
+      await firstSdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-4-isolation", effect: "allow" },
+        { throwOnError: true },
+      )
+
+      const read = async (sdk: ReturnType<typeof createOpencodeClient>) =>
+        (await sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true })).data.data.find(
+          (skill) => skill.name === "ticket-4-isolation",
+        )?.effect
+
+      expect(await read(firstSdk)).toBe("allow")
+      expect(await read(secondSdk)).toBe("deny")
+      const session = await firstSdk.v2.session.create(
+        { agent: "build", location: { directory: first.path } },
+        { throwOnError: true },
+      )
+      const failure = Promise.resolve(
+        secondSdk.v2.skill.permission.list({ agent: "build", sessionID: session.data.data.id }, { throwOnError: true }),
+      ).then(
+        () => undefined,
+        (error) => error,
+      )
+      expect(await failure).toBeInstanceOf(Error)
+      await firstSdk.instance.dispose(undefined, { throwOnError: true })
+      expect(await read(firstSdk)).toBe("deny")
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  test("publishes a Location-qualified event for a successful runtime mutation", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/event", "ticket-4-event", "Event skill"),
+      Bun.write(path.join(project.path, "opencode.json"), JSON.stringify({ formatter: false, lsp: false })),
+    ])
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    const controller = new AbortController()
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const events = await sdk.v2.event.subscribe({ signal: controller.signal })
+      const iterator = events.stream[Symbol.asyncIterator]()
+      expect((await iterator.next()).value?.type).toBe("server.connected")
+
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-4-event", effect: "deny" },
+        { throwOnError: true },
+      )
+      const next = await Promise.race([
+        (async () => {
+          while (true) {
+            const item = await iterator.next()
+            if (item.done) throw new Error("Event stream closed before skill permission event")
+            if (item.value.type === "skill.permission.updated") return item
+          }
+        })(),
+        Bun.sleep(2_000).then(() => {
+          throw new Error("Timed out waiting for skill permission event")
+        }),
+      ])
+
+      expect(next.value).toMatchObject({
+        type: "skill.permission.updated",
+        location: { directory: project.path },
+        data: { agent: "build", name: "ticket-4-event", effect: "deny" },
+      })
+      await iterator.return?.()
+    } finally {
+      controller.abort()
+      await listener.stop()
+    }
+  })
+
+  test("resolves Session rules, saved approvals, and runtime overrides in precedence order", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/session", "ticket-4-session", "Session-controlled skill"),
+      writeSkill(project.path, ".opencode/skills/saved", "ticket-4-saved", "Saved skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({
+          formatter: false,
+          lsp: false,
+          permission: {
+            skill: {
+              "*": "allow",
+              "ticket-4-saved": "ask",
+            },
+          },
+        }),
+      ),
+    ])
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const created = await sdk.session.create(
+        {
+          title: "Skill permission precedence",
+          permission: [{ permission: "skill", pattern: "ticket-4-session", action: "deny" }],
+        },
+        { throwOnError: true },
+      )
+      const sessionID = created.data.id
+      const asked = await sdk.v2.session.permission.create(
+        {
+          sessionID,
+          action: "skill",
+          resources: ["ticket-4-saved"],
+          save: ["ticket-4-saved"],
+          agent: "build",
+        },
+        { throwOnError: true },
+      )
+      expect(asked.data.data.effect).toBe("ask")
+      await sdk.v2.session.permission.reply(
+        { sessionID, requestID: asked.data.data.id, reply: "always" },
+        { throwOnError: true },
+      )
+
+      const before = await sdk.v2.skill.permission.list({ agent: "build", sessionID }, { throwOnError: true })
+      expect(before.data.data.find((skill) => skill.name === "ticket-4-session")?.effect).toBe("deny")
+      expect(before.data.data.find((skill) => skill.name === "ticket-4-saved")?.effect).toBe("allow")
+
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-4-session", effect: "allow" },
+        { throwOnError: true },
+      )
+      await sdk.v2.skill.permission.set(
+        { agent: "build", name: "ticket-4-saved", effect: "ask" },
+        { throwOnError: true },
+      )
+      const after = await sdk.v2.skill.permission.list({ agent: "build", sessionID }, { throwOnError: true })
+      expect(after.data.data.find((skill) => skill.name === "ticket-4-session")?.effect).toBe("allow")
+      expect(after.data.data.find((skill) => skill.name === "ticket-4-saved")?.effect).toBe("ask")
+
+      await sdk.instance.dispose(undefined, { throwOnError: true })
+      const reset = await sdk.v2.skill.permission.list({ agent: "build", sessionID }, { throwOnError: true })
+      expect(reset.data.data.find((skill) => skill.name === "ticket-4-session")?.effect).toBe("deny")
+      expect(reset.data.data.find((skill) => skill.name === "ticket-4-saved")?.effect).toBe("allow")
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  test("enforces runtime skill permissions in V2 authorization", async () => {
+    await using project = await tmpdir({ git: true })
+    await Promise.all([
+      writeSkill(project.path, ".opencode/skills/enforced", "ticket-4-enforced", "Enforced skill"),
+      Bun.write(
+        path.join(project.path, "opencode.json"),
+        JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
+      ),
+    ])
+
+    const listener = await Server.listen({ hostname: "127.0.0.1", port: 0 })
+    try {
+      const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+      const session = await sdk.v2.session.create(
+        { agent: "build", location: { directory: project.path } },
+        { throwOnError: true },
+      )
+      const sessionID = session.data.data.id
+
+      for (const effect of ["allow", "deny", "ask"] as const) {
+        await sdk.v2.skill.permission.set({ agent: "build", name: "ticket-4-enforced", effect }, { throwOnError: true })
+        const listed = await sdk.v2.skill.permission.list({ agent: "build", sessionID }, { throwOnError: true })
+        expect(listed.data.data.find((skill) => skill.name === "ticket-4-enforced")?.effect).toBe(effect)
+        const result = await sdk.v2.session.permission.create(
+          { sessionID, action: "skill", resources: ["ticket-4-enforced"], agent: "build" },
+          { throwOnError: true },
+        )
+        expect(result.data.data.effect).toBe(effect)
+      }
+    } finally {
+      await listener.stop()
+    }
+  })
+
+  it.live(
+    "keeps the V2 skill tool available for exact runtime allow and ask overrides",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const project = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir({ git: true })),
+          (directory) => Effect.promise(() => directory[Symbol.asyncDispose]()),
+        )
+        yield* Effect.promise(() =>
+          Promise.all([
+            writeSkill(project.path, ".opencode/skills/enforced", "ticket-4-provider", "Provider skill"),
+            Bun.write(
+              path.join(project.path, "opencode.json"),
+              JSON.stringify({
+                formatter: false,
+                lsp: false,
+                permissions: [{ action: "skill", resource: "*", effect: "deny" }],
+                providers: {
+                  test: {
+                    env: [],
+                    api: {
+                      type: "aisdk",
+                      package: "@ai-sdk/openai-compatible",
+                      url: llm.url,
+                      settings: {},
+                    },
+                    request: { body: { apiKey: "test-key" } },
+                    models: {
+                      "test-model": {
+                        capabilities: { tools: true, input: ["text"], output: ["text"] },
+                        limit: { context: 100_000, output: 10_000 },
+                      },
+                    },
+                  },
+                },
+              }),
+            ),
+          ]),
+        )
+        const listener = yield* Effect.acquireRelease(
+          Effect.promise(() => Server.listen({ hostname: "127.0.0.1", port: 0 })),
+          (server) => Effect.promise(() => server.stop()),
+        )
+        const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+
+        for (const [index, effect] of (["allow", "ask", "deny"] as const).entries()) {
+          yield* llm.text(`completed ${effect}`)
+          yield* Effect.promise(() =>
+            sdk.v2.skill.permission.set({ agent: "build", name: "ticket-4-provider", effect }, { throwOnError: true }),
+          )
+          const created = yield* Effect.promise(() =>
+            sdk.v2.session.create(
+              {
+                agent: "build",
+                model: { id: "test-model", providerID: "test" },
+                location: { directory: project.path },
+              },
+              { throwOnError: true },
+            ),
+          )
+          yield* Effect.promise(() =>
+            sdk.v2.session.prompt(
+              { sessionID: created.data.data.id, prompt: { text: `test ${effect}` } },
+              { throwOnError: true },
+            ),
+          )
+          yield* llm.wait(index + 1).pipe(
+            Effect.timeoutOrElse({
+              duration: "3 seconds",
+              orElse: () =>
+                Effect.promise(() =>
+                  sdk.v2.session.history({ sessionID: created.data.data.id }, { throwOnError: true }),
+                ).pipe(Effect.flatMap((history) => Effect.die(JSON.stringify(history.data)))),
+            }),
+          )
+          const input = (yield* llm.inputs).at(-1)
+          expect(JSON.stringify(input?.tools).includes('"name":"skill"')).toBe(effect !== "deny")
+        }
+      }),
+    20_000,
+  )
 })

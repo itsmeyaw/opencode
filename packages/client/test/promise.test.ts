@@ -54,6 +54,44 @@ test("sessions.get returns the wire projection", async () => {
   expect(result.time.created).toBe(1_717_171_717_000)
 })
 
+test("skills permission methods use the public HTTP contract", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const location = { directory: "/tmp/project", project: { id: "project", directory: "/tmp/project" } }
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    fetch: async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+      requests.push({ url, init })
+      if (init?.method === "PUT") return Response.json({ location, data: { name: "review", effect: "allow" } })
+      return Response.json({
+        location,
+        data: [
+          {
+            name: "review",
+            description: "Review changes",
+            location: "/tmp/project/.opencode/skills/review/SKILL.md",
+            content: "# Review",
+            effect: "ask",
+          },
+        ],
+      })
+    },
+  })
+
+  const listed = await client.skills.permissions({ agent: "build", sessionID: "ses_test" })
+  const updated = await client.skills.setPermission({ agent: "build", name: "review", effect: "allow" })
+
+  expect(listed.data[0].effect).toBe("ask")
+  expect(updated.data).toEqual({ name: "review", effect: "allow" })
+  expect(requests.map((request) => [request.init?.method, request.url])).toEqual([
+    ["GET", "http://localhost:3000/api/skill/permission?agent=build&sessionID=ses_test"],
+    ["PUT", "http://localhost:3000/api/skill/permission"],
+  ])
+  const body = requests[1]?.init?.body
+  if (typeof body !== "string") throw new Error("Expected JSON request body")
+  expect(JSON.parse(body)).toEqual({ agent: "build", name: "review", effect: "allow" })
+})
+
 test("events.subscribe exposes the Promise event stream wire projection", async () => {
   const client = OpenCode.make({
     baseUrl: "http://localhost:3000",

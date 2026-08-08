@@ -128,6 +128,7 @@ import type {
   PermissionRespondErrors,
   PermissionRespondResponses,
   PermissionRuleset,
+  PermissionV2Effect,
   PermissionV2Reply,
   PermissionV2Source,
   ProjectCommands,
@@ -385,6 +386,10 @@ import type {
   V2SessionWaitResponses,
   V2SkillListErrors,
   V2SkillListResponses,
+  V2SkillPermissionListErrors,
+  V2SkillPermissionListResponses,
+  V2SkillPermissionSetErrors,
+  V2SkillPermissionSetResponses,
   VcsApplyErrors,
   VcsApplyResponses,
   VcsDiffErrors,
@@ -6522,6 +6527,93 @@ export class Command2 extends HeyApiClient {
   }
 }
 
+export class Permission4 extends HeyApiClient {
+  /**
+   * List skill permissions
+   *
+   * Retrieve discovered skills and their effective permission for an agent.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters: {
+      location?: {
+        directory?: string
+        workspace?: string
+      }
+      agent: string
+      sessionID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "location" },
+            { in: "query", key: "agent" },
+            { in: "query", key: "sessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      V2SkillPermissionListResponses,
+      V2SkillPermissionListErrors,
+      ThrowOnError
+    >({
+      url: "/api/skill/permission",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Set skill permission
+   *
+   * Set an exact runtime skill permission override for an agent.
+   */
+  public set<ThrowOnError extends boolean = false>(
+    parameters?: {
+      location?: {
+        directory?: string
+        workspace?: string
+      }
+      agent?: string
+      name?: string
+      effect?: PermissionV2Effect
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "location" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "name" },
+            { in: "body", key: "effect" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<
+      V2SkillPermissionSetResponses,
+      V2SkillPermissionSetErrors,
+      ThrowOnError
+    >({
+      url: "/api/skill/permission",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class Skill extends HeyApiClient {
   /**
    * List skills
@@ -6543,6 +6635,11 @@ export class Skill extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _permission?: Permission4
+  get permission(): Permission4 {
+    return (this._permission ??= new Permission4({ client: this.client }))
   }
 }
 
