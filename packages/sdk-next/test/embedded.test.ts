@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -210,3 +210,78 @@ test("embedded client is available as a Layer service", async () => {
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test("embedded transport adapts generated SDK skill permissions and events", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-embedded-skill-"))
+  const database = Flag.OPENCODE_DB
+  Flag.OPENCODE_DB = join(directory, "opencode.sqlite")
+  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
+  const { OpenCode } = await import("../src")
+
+  try {
+    Bun.spawnSync(["git", "init", directory])
+    await mkdir(join(directory, ".opencode", "skills", "embedded"), { recursive: true })
+    await Bun.write(
+      join(directory, "opencode.json"),
+      JSON.stringify({ formatter: false, lsp: false, permission: { skill: "deny" } }),
+    )
+    await Bun.write(
+      join(directory, ".opencode", "skills", "embedded", "SKILL.md"),
+      "---\nname: embedded-transport\ndescription: Embedded transport skill\n---\n# Embedded",
+    )
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const opencode = yield* OpenCode.create()
+          const events: Array<{ payload?: { type?: string; properties?: { name?: string; effect?: string } } }> = []
+          const unsubscribe = yield* Effect.promise(() =>
+            opencode.transport.events.subscribe((event) =>
+              events.push(event as { payload?: { type?: string; properties?: { name?: string; effect?: string } } }),
+            ),
+          )
+          yield* Effect.promise(async () => {
+            const start = Date.now()
+            while (!events.some((event) => event.payload?.type === "server.connected")) {
+              if (Date.now() - start > 2_000) throw new Error("embedded event transport did not connect")
+              await Bun.sleep(10)
+            }
+          })
+          const sdk = createOpencodeClient({
+            baseUrl: "http://opencode.local",
+            directory,
+            fetch: opencode.transport.fetch,
+          })
+          const before = yield* Effect.promise(() =>
+            sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true }),
+          )
+          expect(before.data.data.find((skill) => skill.name === "embedded-transport")?.effect).toBe("deny")
+          yield* Effect.promise(() =>
+            sdk.v2.skill.permission.set(
+              { agent: "build", name: "embedded-transport", effect: "allow" },
+              { throwOnError: true },
+            ),
+          )
+          const after = yield* Effect.promise(() =>
+            sdk.v2.skill.permission.list({ agent: "build" }, { throwOnError: true }),
+          )
+          expect(after.data.data.find((skill) => skill.name === "embedded-transport")?.effect).toBe("allow")
+          yield* Effect.promise(async () => {
+            const start = Date.now()
+            while (!events.some((event) => event.payload?.type === "skill.permission.updated")) {
+              if (Date.now() - start > 2_000) throw new Error("embedded skill permission event did not arrive")
+              await Bun.sleep(10)
+            }
+          })
+          expect(events.find((event) => event.payload?.type === "skill.permission.updated")?.payload?.properties).toMatchObject({
+            name: "embedded-transport",
+            effect: "allow",
+          })
+          yield* Effect.sync(unsubscribe)
+        }),
+      ),
+    )
+  } finally {
+    Flag.OPENCODE_DB = database
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 10_000)
