@@ -512,7 +512,7 @@ describe("skill HttpApi", () => {
   })
 
   it.live(
-    "keeps the V2 skill tool available for exact runtime allow and ask overrides",
+    "reconciles exact runtime skill guidance across consecutive V2 provider turns",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -557,24 +557,25 @@ describe("skill HttpApi", () => {
         )
         const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
 
+        const created = yield* Effect.promise(() =>
+          sdk.v2.session.create(
+            {
+              agent: "build",
+              model: { id: "test-model", providerID: "test" },
+              location: { directory: project.path },
+            },
+            { throwOnError: true },
+          ),
+        )
+        const sessionID = created.data.data.id
         for (const [index, effect] of (["allow", "ask", "deny"] as const).entries()) {
-          yield* llm.text(`completed ${effect}`)
           yield* Effect.promise(() =>
             sdk.v2.skill.permission.set({ agent: "build", name: "ticket-4-provider", effect }, { throwOnError: true }),
           )
-          const created = yield* Effect.promise(() =>
-            sdk.v2.session.create(
-              {
-                agent: "build",
-                model: { id: "test-model", providerID: "test" },
-                location: { directory: project.path },
-              },
-              { throwOnError: true },
-            ),
-          )
+          yield* llm.text(`completed ${effect}`)
           yield* Effect.promise(() =>
             sdk.v2.session.prompt(
-              { sessionID: created.data.data.id, prompt: { text: `test ${effect}` } },
+              { sessionID, prompt: { text: `test ${effect}` } },
               { throwOnError: true },
             ),
           )
@@ -583,19 +584,27 @@ describe("skill HttpApi", () => {
               duration: "3 seconds",
               orElse: () =>
                 Effect.promise(() =>
-                  sdk.v2.session.history({ sessionID: created.data.data.id }, { throwOnError: true }),
+                  sdk.v2.session.history({ sessionID }, { throwOnError: true }),
                 ).pipe(Effect.flatMap((history) => Effect.die(JSON.stringify(history.data)))),
             }),
           )
-          const input = (yield* llm.inputs).at(-1)
-          expect(JSON.stringify(input?.tools).includes('"name":"skill"')).toBe(effect !== "deny")
         }
+        const inputs = yield* llm.inputs
+        const third = inputs[2] ?? {}
+        const thirdMessages = Array.isArray(third.messages) ? third.messages : []
+        expect(JSON.stringify(inputs[0])).toContain("ticket-4-provider")
+        expect(JSON.stringify(inputs[1])).toContain("ticket-4-provider")
+        expect(JSON.stringify(thirdMessages.at(-1))).not.toContain("ticket-4-provider")
+        expect(JSON.stringify(thirdMessages.at(-1))).toContain("Skill guidance is no longer available")
+        expect(JSON.stringify(thirdMessages[0])).toContain("ticket-4-provider")
+        expect(JSON.stringify(inputs[2]?.messages)).toContain("test allow")
+        expect(JSON.stringify(inputs[2]?.messages)).toContain("test ask")
       }),
     20_000,
   )
 
   it.live(
-    "applies one runtime skill mutation consistently to V2 authorization and legacy provider turns",
+    "reconciles Session policy and runtime skill guidance across consecutive legacy provider turns",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -620,20 +629,20 @@ describe("skill HttpApi", () => {
           (server) => Effect.promise(() => server.stop()),
         )
         const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
+        const legacy = yield* Effect.promise(() =>
+          sdk.session.create(
+            {
+              title: "Legacy runtime skill permissions",
+              permission: [{ permission: "skill", pattern: "ticket-5-provider", action: "deny" }],
+            },
+            { throwOnError: true },
+          ),
+        )
         for (const [index, effect] of (["allow", "ask", "deny"] as const).entries()) {
           yield* Effect.promise(() =>
             sdk.v2.skill.permission.set({ agent: "build", name: "ticket-5-provider", effect }, { throwOnError: true }),
           )
 
-          const legacy = yield* Effect.promise(() =>
-            sdk.session.create(
-              {
-                title: `Legacy runtime skill permission ${effect}`,
-                permission: [{ permission: "skill", pattern: "ticket-5-provider", action: "deny" }],
-              },
-              { throwOnError: true },
-            ),
-          )
           const authorized = yield* Effect.promise(() =>
             sdk.v2.session.permission.create(
               {
@@ -666,10 +675,13 @@ describe("skill HttpApi", () => {
             }),
           )
 
-          const input = (yield* llm.inputs).at(-1)
-          expect(JSON.stringify(input?.tools).includes('"name":"skill"')).toBe(effect !== "deny")
-          expect(JSON.stringify(input).includes("ticket-5-provider")).toBe(effect !== "deny")
         }
+        const inputs = yield* llm.inputs
+        expect(JSON.stringify(inputs[0])).toContain("ticket-5-provider")
+        expect(JSON.stringify(inputs[1])).toContain("ticket-5-provider")
+        expect(JSON.stringify(inputs[2])).not.toContain("ticket-5-provider")
+        expect(JSON.stringify(inputs[2]?.messages)).toContain("test legacy allow")
+        expect(JSON.stringify(inputs[2]?.messages)).toContain("test legacy ask")
       }),
     30_000,
   )
