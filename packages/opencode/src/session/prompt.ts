@@ -1225,14 +1225,20 @@ const layer = Layer.effect(
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
-            const skillRules = yield* permission.resolveSkills({
+            const skillStates = yield* permission.resolveSkills({
               agent: agent.name,
               sessionID,
               names: (yield* skill.all()).map((item) => item.name),
             })
             const effectiveSession = {
               ...session,
-              permission: Permission.merge(session.permission ?? [], skillRules),
+              permission: Permission.merge(session.permission ?? [], [
+                {
+                  permission: "skill",
+                  pattern: "*",
+                  action: skillStates.some((item) => item.effect !== "deny") ? "allow" : "deny",
+                },
+              ]),
             }
 
             const tools = yield* SessionTools.resolve({
@@ -1251,8 +1257,6 @@ const layer = Layer.effect(
               Effect.provideService(Truncate.Service, truncate),
               Effect.provideService(RuntimeFlags.Service, flags),
             )
-            if (skillRules.length > 0 && skillRules.every((rule) => rule.action === "deny")) delete tools.skill
-
             if (lastUser.format?.type === "json_schema") {
               tools["StructuredOutput"] = createStructuredOutputTool({
                 schema: lastUser.format.schema,
@@ -1268,7 +1272,7 @@ const layer = Layer.effect(
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent, effectiveSession.permission),
+              sys.skills(agent, new Set(skillStates.filter((item) => item.effect === "deny").map((item) => item.name))),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),

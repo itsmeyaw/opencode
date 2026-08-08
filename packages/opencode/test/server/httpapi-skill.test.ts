@@ -595,7 +595,7 @@ describe("skill HttpApi", () => {
   )
 
   it.live(
-    "applies one runtime skill mutation consistently to V2 and legacy provider turns",
+    "applies one runtime skill mutation consistently to V2 authorization and legacy provider turns",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -762,7 +762,7 @@ describe("skill HttpApi", () => {
   )
 
   it.live(
-    "reconciles legacy pending skill requests using the issuing agent",
+    "keeps wildcard characters in runtime skill names exact for legacy turns",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -772,20 +772,11 @@ describe("skill HttpApi", () => {
         )
         yield* Effect.promise(() =>
           Promise.all([
-            writeSkill(project.path, ".opencode/skills/pending", "ticket-5-pending", "Pending legacy skill"),
+            writeSkill(project.path, ".opencode/skills/star", "ticket-5-literal*", "Allowed literal wildcard skill"),
+            writeSkill(project.path, ".opencode/skills/question", "ticket-5-literal?", "Denied similar skill"),
             Bun.write(
               path.join(project.path, "opencode.json"),
-              JSON.stringify({
-                ...testProviderConfig(llm.url),
-                permission: { skill: "ask" },
-                agent: {
-                  reviewer: {
-                    description: "Reviews pending skill requests",
-                    mode: "primary",
-                    permission: { skill: "ask" },
-                  },
-                },
-              }),
+              JSON.stringify({ ...testProviderConfig(llm.url), permission: { skill: "deny" } }),
             ),
           ]),
         )
@@ -795,86 +786,34 @@ describe("skill HttpApi", () => {
         )
         const sdk = createOpencodeClient({ baseUrl: listener.url.href, directory: project.path })
         yield* Effect.promise(() =>
-          Promise.all(
-            ["build", "reviewer"].map((agent) =>
-              sdk.v2.skill.permission.set({ agent, name: "ticket-5-pending", effect: "ask" }, { throwOnError: true }),
-            ),
+          sdk.v2.skill.permission.set(
+            { agent: "build", name: "ticket-5-literal*", effect: "allow" },
+            { throwOnError: true },
           ),
         )
-
-        yield* llm.tool("skill", { name: "ticket-5-pending" })
-        const build = yield* Effect.promise(() =>
-          sdk.session.create({ title: "Build pending skill" }, { throwOnError: true }),
+        const session = yield* Effect.promise(() =>
+          sdk.session.create({ title: "Exact wildcard skill permission" }, { throwOnError: true }),
         )
-        const buildPrompt = yield* Effect.promise(() =>
+
+        yield* llm.text("completed exact wildcard test")
+        yield* Effect.promise(() =>
           sdk.session.prompt(
             {
-              sessionID: build.data.id,
+              sessionID: session.data.id,
               agent: "build",
               model: { providerID: "test", modelID: "test-model" },
-              parts: [{ type: "text", text: "load the pending skill as build" }],
+              parts: [{ type: "text", text: "test exact wildcard permissions" }],
             },
             { throwOnError: true },
           ),
-        ).pipe(Effect.forkScoped)
-        yield* pollWithTimeout(
-          Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
-            Effect.map((result) => result.data.find((request) => request.sessionID === build.data.id)),
-          ),
-          "build skill request did not become pending",
         )
+        yield* llm.wait(1)
 
-        yield* llm.tool("skill", { name: "ticket-5-pending" })
-        const reviewer = yield* Effect.promise(() =>
-          sdk.session.create({ title: "Reviewer pending skill" }, { throwOnError: true }),
-        )
-        const reviewerPrompt = yield* Effect.promise(() =>
-          sdk.session.prompt(
-            {
-              sessionID: reviewer.data.id,
-              agent: "reviewer",
-              model: { providerID: "test", modelID: "test-model" },
-              parts: [{ type: "text", text: "load the pending skill as reviewer" }],
-            },
-            { throwOnError: true },
-          ),
-        ).pipe(Effect.forkScoped)
-        yield* pollWithTimeout(
-          Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
-            Effect.map((result) => (result.data.length === 2 ? result.data : undefined)),
-          ),
-          "both agent-specific skill requests did not become pending",
-        )
-
-        yield* llm.text("build completed")
-        yield* Effect.promise(() =>
-          sdk.v2.skill.permission.set(
-            { agent: "build", name: "ticket-5-pending", effect: "allow" },
-            { throwOnError: true },
-          ),
-        )
-        yield* pollWithTimeout(
-          Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true })).pipe(
-            Effect.map((result) =>
-              result.data.length === 1 && result.data[0]?.sessionID === reviewer.data.id ? result.data[0] : undefined,
-            ),
-          ),
-          "build allow did not release only the build request",
-        )
-        yield* Fiber.join(buildPrompt)
-
-        yield* llm.text("reviewer completed")
-        yield* Effect.promise(() =>
-          sdk.v2.skill.permission.set(
-            { agent: "reviewer", name: "ticket-5-pending", effect: "deny" },
-            { throwOnError: true },
-          ),
-        )
-        yield* Fiber.join(reviewerPrompt)
-        const remaining = yield* Effect.promise(() => sdk.permission.list(undefined, { throwOnError: true }))
-        expect(remaining.data).toEqual([])
+        const input = JSON.stringify((yield* llm.inputs).at(-1))
+        expect(input).toContain("ticket-5-literal*")
+        expect(input).not.toContain("ticket-5-literal?")
       }),
-    30_000,
+    20_000,
   )
 
   it.live(
